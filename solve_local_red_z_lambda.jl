@@ -5,6 +5,9 @@ include("assert_solution.jl")
 include("solve_master_z_with_restarts.jl")
 include("initialize_master_z.jl")
 include("compute_milp_selector_big_m.jl")
+if !(@isdefined local_reduction_g_row_count)
+    include("local_reduction_state_rows.jl")
+end
 
 function _z_master_g_row_values(
     z_scenario,
@@ -19,13 +22,25 @@ function _z_master_g_row_values(
     pv_cost,
     base_pv_capacity_kw,
     e_batt;
+    soc0,
+    soc_min,
+    soc_max,
+    delta_t,
+    energy_scale,
     two_batt::Bool=true,
+    is_cycle::Bool=false,
 )
     u_dim = two_batt ? 4 : 2
     l_dim_per_t = two_batt ? 6 : 4
     n_t = div(length(u_star), u_dim)
     cost_scale = max(abs(base_pv_capacity_kw * pv_cost), abs(e_batt * battery_cost), 1.0)
     g_values = Float64[]
+    x1 = Vector{Float64}(undef, n_t + 1)
+    x2 = two_batt ? Vector{Float64}(undef, n_t + 1) : Float64[]
+    x1[1] = soc0 * n_star * e_batt
+    if two_batt
+        x2[1] = soc0 * m_star * e_batt
+    end
 
     for t in 1:n_t
         w_idx = 6 * (t - 1)
@@ -45,9 +60,36 @@ function _z_master_g_row_values(
         g_bal_plus_t = z_scenario[z_idx + 1] - z_scenario[z_idx + 2] + u_star[u_idx + 2] - u_star[u_idx + 1] + (two_batt ? u_star[u_idx + 4] - u_star[u_idx + 3] : 0.0) - PL_t + s_star * PR_t
         push!(g_values, g_bal_plus_t)
         push!(g_values, -g_bal_plus_t)
+
+        eta_ch_t = w_scenario[w_idx + 5]
+        rho_dis_t = w_scenario[w_idx + 6]
+        x1[t + 1] = x1[t] + (eta_ch_t * u_star[u_idx + 1] - rho_dis_t * u_star[u_idx + 2]) * delta_t
+        if two_batt
+            x2[t + 1] = x2[t] + (eta_ch_t * u_star[u_idx + 3] - rho_dis_t * u_star[u_idx + 4]) * delta_t
+        end
     end
 
-    g_epi = sum(
+    for t in 1:(n_t + 1)
+        push!(g_values, (soc_min * n_star * e_batt - x1[t]) / energy_scale)
+        push!(g_values, (x1[t] - soc_max * n_star * e_batt) / energy_scale)
+        if two_batt
+            push!(g_values, (soc_min * m_star * e_batt - x2[t]) / energy_scale)
+            push!(g_values, (x2[t] - soc_max * m_star * e_batt) / energy_scale)
+        end
+    end
+
+    if is_cycle
+        terminal1 = (x1[end] - soc0 * n_star * e_batt) / energy_scale
+        push!(g_values, terminal1)
+        push!(g_values, -terminal1)
+        if two_batt
+            terminal2 = (x2[end] - soc0 * m_star * e_batt) / energy_scale
+            push!(g_values, terminal2)
+            push!(g_values, -terminal2)
+        end
+    end
+
+    g_epi = delta_t * sum(
         w_scenario[6 * (t - 1) + 3] * z_scenario[2 * (t - 1) + 1] -
         w_scenario[6 * (t - 1) + 4] * z_scenario[2 * (t - 1) + 2]
         for t in 1:n_t
@@ -69,6 +111,148 @@ function _push_milp_row!(g_rows, g_lbs, g_ubs, expr, lb, ub)
     push!(g_rows, expr)
     push!(g_lbs, Float64(lb))
     push!(g_ubs, Float64(ub))
+    return nothing
+end
+
+function _push_state_row!(g_rows, g_lbs, g_ubs, expr, lb, ub; collect_bounds::Bool)
+    push!(g_rows, expr)
+    if collect_bounds
+        push!(g_lbs, Float64(lb))
+        push!(g_ubs, Float64(ub))
+    end
+    return nothing
+end
+
+function _append_state_g_rows!(
+    g_rows,
+    g_lbs,
+    g_ubs,
+    x,
+    state_bounds,
+    grid_size,
+    soc0,
+    soc_min,
+    soc_max,
+    n_star,
+    m_star,
+    e_batt,
+    energy_scale;
+    two_batt::Bool=true,
+    is_cycle::Bool=false,
+    collect_bounds::Bool=false,
+)
+    cap1 = n_star * e_batt
+    cap2 = two_batt ? m_star * e_batt : 0.0
+    for t in 1:grid_size
+        lower_expr = (soc_min * cap1 - x[t]) / energy_scale
+        upper_expr = (x[t] - soc_max * cap1) / energy_scale
+        if collect_bounds
+            _push_state_row!(
+                g_rows,
+                g_lbs,
+                g_ubs,
+                lower_expr,
+                (soc_min * cap1 - state_bounds.x1_max[t]) / energy_scale,
+                (soc_min * cap1 - state_bounds.x1_min[t]) / energy_scale,
+                collect_bounds=collect_bounds,
+            )
+            _push_state_row!(
+                g_rows,
+                g_lbs,
+                g_ubs,
+                upper_expr,
+                (state_bounds.x1_min[t] - soc_max * cap1) / energy_scale,
+                (state_bounds.x1_max[t] - soc_max * cap1) / energy_scale,
+                collect_bounds=collect_bounds,
+            )
+        else
+            _push_state_row!(g_rows, g_lbs, g_ubs, lower_expr, 0.0, 0.0, collect_bounds=collect_bounds)
+            _push_state_row!(g_rows, g_lbs, g_ubs, upper_expr, 0.0, 0.0, collect_bounds=collect_bounds)
+        end
+
+        if two_batt
+            lower_expr = (soc_min * cap2 - x[grid_size + t]) / energy_scale
+            upper_expr = (x[grid_size + t] - soc_max * cap2) / energy_scale
+            if collect_bounds
+                _push_state_row!(
+                    g_rows,
+                    g_lbs,
+                    g_ubs,
+                    lower_expr,
+                    (soc_min * cap2 - state_bounds.x2_max[t]) / energy_scale,
+                    (soc_min * cap2 - state_bounds.x2_min[t]) / energy_scale,
+                    collect_bounds=collect_bounds,
+                )
+                _push_state_row!(
+                    g_rows,
+                    g_lbs,
+                    g_ubs,
+                    upper_expr,
+                    (state_bounds.x2_min[t] - soc_max * cap2) / energy_scale,
+                    (state_bounds.x2_max[t] - soc_max * cap2) / energy_scale,
+                    collect_bounds=collect_bounds,
+                )
+            else
+                _push_state_row!(g_rows, g_lbs, g_ubs, lower_expr, 0.0, 0.0, collect_bounds=collect_bounds)
+                _push_state_row!(g_rows, g_lbs, g_ubs, upper_expr, 0.0, 0.0, collect_bounds=collect_bounds)
+            end
+        end
+    end
+
+    if is_cycle
+        terminal1 = (x[grid_size] - soc0 * cap1) / energy_scale
+        if collect_bounds
+            _push_state_row!(
+                g_rows,
+                g_lbs,
+                g_ubs,
+                terminal1,
+                (state_bounds.x1_min[end] - soc0 * cap1) / energy_scale,
+                (state_bounds.x1_max[end] - soc0 * cap1) / energy_scale,
+                collect_bounds=collect_bounds,
+            )
+            _push_state_row!(
+                g_rows,
+                g_lbs,
+                g_ubs,
+                -terminal1,
+                (soc0 * cap1 - state_bounds.x1_max[end]) / energy_scale,
+                (soc0 * cap1 - state_bounds.x1_min[end]) / energy_scale,
+                collect_bounds=collect_bounds,
+            )
+        else
+            _push_state_row!(g_rows, g_lbs, g_ubs, terminal1, 0.0, 0.0, collect_bounds=collect_bounds)
+            _push_state_row!(g_rows, g_lbs, g_ubs, -terminal1, 0.0, 0.0, collect_bounds=collect_bounds)
+        end
+
+        if two_batt
+            terminal2 = (x[2 * grid_size] - soc0 * cap2) / energy_scale
+            if collect_bounds
+                _push_state_row!(
+                    g_rows,
+                    g_lbs,
+                    g_ubs,
+                    terminal2,
+                    (state_bounds.x2_min[end] - soc0 * cap2) / energy_scale,
+                    (state_bounds.x2_max[end] - soc0 * cap2) / energy_scale,
+                    collect_bounds=collect_bounds,
+                )
+                _push_state_row!(
+                    g_rows,
+                    g_lbs,
+                    g_ubs,
+                    -terminal2,
+                    (soc0 * cap2 - state_bounds.x2_max[end]) / energy_scale,
+                    (soc0 * cap2 - state_bounds.x2_min[end]) / energy_scale,
+                    collect_bounds=collect_bounds,
+                )
+            else
+                _push_state_row!(g_rows, g_lbs, g_ubs, terminal2, 0.0, 0.0, collect_bounds=collect_bounds)
+                _push_state_row!(g_rows, g_lbs, g_ubs, -terminal2, 0.0, 0.0, collect_bounds=collect_bounds)
+            end
+        end
+    end
+
     return nothing
 end
 
@@ -143,8 +327,6 @@ function solve_local_red_z_lambda(
     u_dim = two_batt ? 4 : 2
     nlp_l_dim_per_t = two_batt ? 6 : 4
     milp_l_dim_per_t = two_batt ? 3 : 2
-    nlp_rows_per_t = two_batt ? 5 : 4
-    milp_rows_per_t = two_batt ? 14 : 10
     s_blocks = Vector{Vector{VariableRef}}(undef, k2_max)
     # Build master z problem (used to solve for z in the local reduction subroutine)
     ypad = "    "
@@ -191,11 +373,24 @@ function solve_local_red_z_lambda(
     w = master_z[:w]
     sigma = master_z[:sigma]
     n_t = grid_size - 1
-    n_rows_s = (is_milp ? milp_rows_per_t : nlp_rows_per_t) * n_t + 1
+    n_rows_s = local_reduction_g_row_count(grid_size; two_batt=two_batt, is_milp=is_milp, is_cycle=is_cycle)
     cost_scale = max(abs(base_pv_capacity_kw * pv_cost), abs(e_batt * battery_cost), 1.0)
+    energy_scale = max(abs(e_batt * max(n_star, two_batt ? m_star : n_star)), 1.0)
     n_w = size(P, 2)
     w_ub = p[1:n_w]
     w_lb = -p[n_w + 1:2 * n_w]
+    state_bounds = fixed_dispatch_state_envelope(
+        u_star,
+        w_lb,
+        w_ub,
+        grid_size,
+        soc0,
+        n_star,
+        m_star,
+        delta_t,
+        e_batt;
+        two_batt=two_batt,
+    )
 
     g_rows = Any[]
     g_lbs = Float64[]
@@ -248,8 +443,27 @@ function solve_local_red_z_lambda(
         end
     end
 
+    _append_state_g_rows!(
+        g_rows,
+        g_lbs,
+        g_ubs,
+        master_z[:x],
+        state_bounds,
+        grid_size,
+        soc0,
+        soc_min,
+        soc_max,
+        n_star,
+        m_star,
+        e_batt,
+        energy_scale;
+        two_batt=two_batt,
+        is_cycle=is_cycle,
+        collect_bounds=is_milp,
+    )
+
     # Epigraph row
-    g_epi = sum(
+    g_epi = delta_t * sum(
         w[6 * (t - 1) + 3, 1] * z_initial[2 * (t - 1) + 1] -
         w[6 * (t - 1) + 4, 1] * z_initial[2 * (t - 1) + 2]
         for t in 1:n_t
@@ -259,17 +473,17 @@ function solve_local_red_z_lambda(
     if is_milp
         epi_fixed = (n_star + (two_batt ? m_star : 0.0)) * e_batt * battery_cost + s_star * base_pv_capacity_kw * pv_cost - gamma_star
         epi_lb = (
-            sum(
-                w_lb[6 * (t - 1) + 3] * z_initial[2 * (t - 1) + 1] -
-                w_ub[6 * (t - 1) + 4] * z_initial[2 * (t - 1) + 2]
-                for t in 1:n_t
+                delta_t * sum(
+                    w_lb[6 * (t - 1) + 3] * z_initial[2 * (t - 1) + 1] -
+                    w_ub[6 * (t - 1) + 4] * z_initial[2 * (t - 1) + 2]
+                    for t in 1:n_t
             ) + epi_fixed
         ) / cost_scale
         epi_ub = (
-            sum(
-                w_ub[6 * (t - 1) + 3] * z_initial[2 * (t - 1) + 1] -
-                w_lb[6 * (t - 1) + 4] * z_initial[2 * (t - 1) + 2]
-                for t in 1:n_t
+                delta_t * sum(
+                    w_ub[6 * (t - 1) + 3] * z_initial[2 * (t - 1) + 1] -
+                    w_lb[6 * (t - 1) + 4] * z_initial[2 * (t - 1) + 2]
+                    for t in 1:n_t
             ) + epi_fixed
         ) / cost_scale
         push!(g_lbs, epi_lb)
@@ -297,6 +511,7 @@ function solve_local_red_z_lambda(
     z_scenarios_used = 1
     sigma_bar_star = 0.0
     x_witness = zeros((two_batt ? 2 : 1) * grid_size)
+    z_termination_reason = "not_started"
     w_mid = 0.5 .* (-p[size(P, 2) + 1:2 * size(P, 2)] .+ p[1:size(P, 2)])
     s_start_vectors = Union{Nothing, Vector{Float64}}[nothing for _ in 1:z_scenarios_used]
     if !is_milp
@@ -310,12 +525,18 @@ function solve_local_red_z_lambda(
                 n_star,
                 m_star,
                 s_star,
-            battery_cost,
-            pv_cost,
-            base_pv_capacity_kw,
-            e_batt,
-            two_batt=two_batt,
-        ),
+                battery_cost,
+                pv_cost,
+                base_pv_capacity_kw,
+                e_batt,
+                soc0=soc0,
+                soc_min=soc_min,
+                soc_max=soc_max,
+                delta_t=delta_t,
+                energy_scale=energy_scale,
+                two_batt=two_batt,
+                is_cycle=is_cycle,
+            ),
         )
     end
     initialize_master_z!(
@@ -374,7 +595,12 @@ function solve_local_red_z_lambda(
                 battery_cost,
                 pv_cost,
                 base_pv_capacity_kw,
+                soc0,
+                soc_min,
+                soc_max,
+                delta_t,
                 e_batt,
+                energy_scale,
                 u_star,
                 w_star,
                 gamma_star,
@@ -384,6 +610,7 @@ function solve_local_red_z_lambda(
                 s_star,
                 is_silent,
                 two_batt=two_batt,
+                is_cycle=is_cycle,
             )
         else
             # Set the current solutions to the master max y problem
@@ -391,6 +618,7 @@ function solve_local_red_z_lambda(
             fix.(max_z_model[:w_star_var], w_star, force = true)
             fix(max_z_model[:gamma_star_var], gamma_star, force = true)
             fix(max_z_model[:sigma_star_var], sigma_star, force = true)
+            fix(max_z_model[:energy_scale_star_var], energy_scale, force = true)
             fix(max_z_model[:n_star_var], n_star, force = true)
             if two_batt
                 fix(max_z_model[:m_star_var], m_star, force = true)
@@ -415,6 +643,7 @@ function solve_local_red_z_lambda(
         # Check if the lambda local reduction found a violation above the tolerance level
         if sigma_bar_star > tol_2
             if z_scenarios_used + 1 > k2_max
+                z_termination_reason = "max_z_scenarios_reached"
                 println(ypad, "Z-stop: reached max z scenarios.")
                 println(ypad)
                 break
@@ -478,8 +707,27 @@ function solve_local_red_z_lambda(
                 end
             end
 
+            _append_state_g_rows!(
+                g_rows,
+                g_lbs,
+                g_ubs,
+                master_z[:x],
+                state_bounds,
+                grid_size,
+                soc0,
+                soc_min,
+                soc_max,
+                n_star,
+                m_star,
+                e_batt,
+                energy_scale;
+                two_batt=two_batt,
+                is_cycle=is_cycle,
+                collect_bounds=is_milp,
+            )
+
             # Epigraph row
-            g_epi = sum(
+            g_epi = delta_t * sum(
                 w[6 * (t - 1) + 3, 1] * z_star[2 * (t - 1) + 1] -
                 w[6 * (t - 1) + 4, 1] * z_star[2 * (t - 1) + 2]
                 for t in 1:n_t
@@ -489,14 +737,14 @@ function solve_local_red_z_lambda(
             if is_milp
                 epi_fixed = (n_star + (two_batt ? m_star : 0.0)) * e_batt * battery_cost + s_star * base_pv_capacity_kw * pv_cost - gamma_star
                 epi_lb = (
-                    sum(
+                    delta_t * sum(
                         w_lb[6 * (t - 1) + 3] * z_star[2 * (t - 1) + 1] -
                         w_ub[6 * (t - 1) + 4] * z_star[2 * (t - 1) + 2]
                         for t in 1:n_t
                     ) + epi_fixed
                 ) / cost_scale
                 epi_ub = (
-                    sum(
+                    delta_t * sum(
                         w_ub[6 * (t - 1) + 3] * z_star[2 * (t - 1) + 1] -
                         w_lb[6 * (t - 1) + 4] * z_star[2 * (t - 1) + 2]
                         for t in 1:n_t
@@ -540,7 +788,13 @@ function solve_local_red_z_lambda(
                         pv_cost,
                         base_pv_capacity_kw,
                         e_batt,
+                        soc0=soc0,
+                        soc_min=soc_min,
+                        soc_max=soc_max,
+                        delta_t=delta_t,
+                        energy_scale=energy_scale,
                         two_batt=two_batt,
+                        is_cycle=is_cycle,
                     ),
                 )
             end
@@ -565,11 +819,12 @@ function solve_local_red_z_lambda(
             println(ypad, "  Added Z scenario ", z_scenarios_used, " | new #z scenarios=", z_scenarios_used)
             println(ypad)
         else
+            z_termination_reason = "no_z_violation"
             println(ypad, "Z-stop: no violation above tolerance.")
             println(ypad)
             break
         end
     end
 
-    return sigma_star, w_star, x_witness, z_scenarios_used, z_scenarios_history, lambda_scenarios_history
+    return sigma_star, w_star, x_witness, z_scenarios_used, z_scenarios_history, lambda_scenarios_history, z_termination_reason
 end

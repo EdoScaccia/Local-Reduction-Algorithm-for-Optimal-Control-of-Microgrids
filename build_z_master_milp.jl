@@ -4,6 +4,10 @@ using HiGHS
 using Gurobi
 using SCIP
 
+if !(@isdefined local_reduction_g_row_count)
+    include("local_reduction_state_rows.jl")
+end
+
 function build_z_master_milp(
     s_blocks,
     milp_optimizer,
@@ -39,8 +43,7 @@ function build_z_master_milp(
     n_rows_w = size(P, 2)
     n_t = grid_size - 1
     u_dim = two_batt ? 4 : 2
-    n_logic_rows = two_batt ? 12 : 8
-    n_rows_s = (n_logic_rows + 2) * n_t + 1
+    n_rows_s = local_reduction_g_row_count(grid_size; two_batt=two_batt, is_milp=true, is_cycle=is_cycle)
     w_ub = p[1:n_rows_w]
     w_lb = -p[n_rows_w + 1:2 * n_rows_w]
     w_mid = 0.5 .* (w_lb .+ w_ub)
@@ -78,21 +81,9 @@ function build_z_master_milp(
 
     # Constraint on uncertainty
     @constraint(model, P * w - p .<= 0)
-    @constraint(model, [t in 1:grid_size], (x[t] - soc_min * n_star * e_batt) / energy_scale >= 0)
-    @constraint(model, [t in 1:grid_size], (x[t] - soc_max * n_star * e_batt) / energy_scale <= 0)
-    if two_batt
-        @constraint(model, [t in 1:grid_size], (x[grid_size + t] - soc_min * m_star * e_batt) / energy_scale >= 0)
-        @constraint(model, [t in 1:grid_size], (x[grid_size + t] - soc_max * m_star * e_batt) / energy_scale <= 0)
-    end
     @constraint(model, (x[1] - soc0 * n_star * e_batt) / energy_scale == 0)
-    if is_cycle
-        @constraint(model, (x[grid_size] - soc0 * n_star * e_batt) / energy_scale == 0)
-    end
     if two_batt
         @constraint(model, (x[grid_size + 1] - soc0 * m_star * e_batt) / energy_scale == 0)
-        if is_cycle
-            @constraint(model, (x[2 * grid_size] - soc0 * m_star * e_batt) / energy_scale == 0)
-        end
     end
     # Simplex constraint on s
     @constraint(model, sum(s_blocks[1]) == 1)

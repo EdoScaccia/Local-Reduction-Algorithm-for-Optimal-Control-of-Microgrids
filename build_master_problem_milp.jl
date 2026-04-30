@@ -3,6 +3,10 @@ using HiGHS
 using Gurobi
 using SCIP
 
+if !(@isdefined add_exact_robust_microgrid_constraints!)
+    include("exact_robust_microgrid_constraints.jl")
+end
+
 function build_master_problem_milp(
     milp_optimizer,
     x_blocks,
@@ -38,6 +42,7 @@ function build_master_problem_milp(
     """
     n_w = size(P, 2)
     cost_scale = max(abs(base_pv_capacity_kw * pv_cost), abs(e_batt * battery_cost), 1.0)
+    energy_scale = max(abs(e_batt * max(n_max, m_max)), 1.0)
 
     # Check if an initial scenario is provided and if so, check it is feasible and has the correct dimension
     if w_init !== nothing
@@ -188,11 +193,37 @@ function build_master_problem_milp(
     @constraint(
         model,
         (battery_count * e_batt * battery_cost + s * base_pv_capacity_kw * pv_cost +
-        sum(
+        delta_t * sum(
             w_init[6 * (t - 1) + 3] * z_blocks[1][2 * (t - 1) + 1] -
             w_init[6 * (t - 1) + 4] * z_blocks[1][2 * (t - 1) + 2]
             for t in 1:grid_size-1
         ) - gamma) / cost_scale <= 0
+    )
+
+    add_exact_robust_microgrid_constraints!(
+        model,
+        u,
+        gamma,
+        n,
+        two_batt ? m : nothing,
+        s,
+        P,
+        p,
+        H,
+        h,
+        grid_size,
+        soc0,
+        soc_min,
+        soc_max,
+        battery_cost,
+        pv_cost,
+        base_pv_capacity_kw,
+        delta_t,
+        e_batt,
+        cost_scale,
+        energy_scale;
+        two_batt=two_batt,
+        is_cycle=is_cycle,
     )
 
     # Objective is to minimize gamma

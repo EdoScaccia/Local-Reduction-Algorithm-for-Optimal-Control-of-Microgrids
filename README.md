@@ -32,9 +32,9 @@ This folder contains the local-reduction implementation for the microgrid sizing
 
 ## Current Microgrid Model
 
-The current model has two independent battery packs and one shared grid connection/PV sizing variable.
-
-Sizing variables:
+The code supports either one battery pack or two independent battery packs,
+with one shared grid connection/PV sizing variable. In the two-pack model the
+sizing variables are:
 
 ```julia
 n >= 1   # number of battery pack 1 units
@@ -45,24 +45,37 @@ s >= 1   # PV capacity multiplier
 The objective epigraph uses:
 
 ```julia
-(n + m) * battery_cost + s * base_pv_capacity_kw * pv_cost + grid_cost - gamma <= 0
+(n + m) * e_batt * battery_cost + s * base_pv_capacity_kw * pv_cost + delta_t * grid_cost - gamma <= 0
 ```
+
+Here `grid_cost` is the sum of buy-price times import minus sell-price
+times export over all control intervals. The `delta_t` factor converts the
+15-minute power-price sum to an energy-price operating cost.
 
 Internally, the master objective and epigraph row are scaled by a cost scale
 
 ```julia
-cost_scale = max(base_pv_capacity_kw * pv_cost, battery_cost, 1.0)
+cost_scale = max(base_pv_capacity_kw * pv_cost, e_batt * battery_cost, 1.0)
 ```
 
 so the solver sees an objective of order 1 rather than order `1e5`. The reported `gamma_star` is still recovered from the unscaled `gamma` variable.
 
-Because the two battery packs are physically identical, the master includes the symmetry-breaking constraint:
+Because the two battery packs are physically identical, the master could include the symmetry-breaking constraint:
 
 ```julia
 n >= m
 ```
 
-This does not remove any achievable aggregate battery capacity; it only prevents Ipopt from exploring duplicate solutions with the pack labels swapped.
+This does not remove any achievable aggregate battery capacity; it only prevents duplicate solutions with the pack labels swapped. The constraint is currently left commented out in the master builders.
+
+The master also includes exact robust microgrid endpoint constraints. For the fixed battery schedule and box uncertainty set, these enforce:
+
+- endpoint grid feasibility for `Pc + PL - s * PR - Pd`
+- endpoint SoC lower/upper envelopes under `eta_ch` and `rho_dis`
+- terminal-cycle endpoint equality when `is_cycle=true`
+- an exact worst-case operating-cost epigraph using the adverse price endpoints
+
+With these rows active, `run_local_reduction_nonlinear_existence` stops after the exact robust master solve by default with `termination_reason = "exact_robust_master_solved"`. Set `stop_after_exact_robust_master=false` to continue into the generic sampled local-reduction oracle.
 
 ## Variable Layout
 
@@ -121,7 +134,7 @@ Thus each scenario logic vector has length:
 The nested `z` local-reduction row count is:
 
 ```julia
-n_rows_s = 5 * n_t + 1
+n_rows_s = 5 * n_t + 1 + 4 * (n_t + 1) + (is_cycle ? 4 : 0)
 ```
 
 corresponding to:
@@ -129,6 +142,8 @@ corresponding to:
 - 3 logic rows per interval: battery 1, grid, battery 2
 - 2 power-balance rows per interval
 - 1 epigraph row
+- 2 SoC bound rows per battery and state grid point
+- 2 terminal-cycle equality rows per battery when `is_cycle=true`
 
 ## Power Balance
 
@@ -184,8 +199,8 @@ To revert to the previous one-pack model, the main edits are:
 3. Remove the sizing variable `m`.
 4. Remove the second battery state bounds, initial condition, and dynamics.
 5. Change the logic vector back to `4 * n_t` entries with only battery and grid simplex pairs.
-6. Change `n_rows_s` in the nested z-master back to `4 * n_t + 1`.
-7. Replace `(n + m) * battery_cost` with `n * battery_cost`.
+6. Change `n_rows_s` in the nested z-master to `4 * n_t + 1 + 2 * (n_t + 1) + (is_cycle ? 2 : 0)`.
+7. Replace `(n + m) * e_batt * battery_cost` with `n * e_batt * battery_cost`.
 8. Replace the power balance with:
 
 ```julia

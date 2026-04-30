@@ -16,9 +16,15 @@ function build_max_z_lp(
     battery_cost,
     pv_cost,
     base_pv_capacity_kw,
+    soc0,
+    soc_min,
+    soc_max,
+    delta_t,
     e_batt,
+    energy_scale,
     is_silent;
     two_batt::Bool=true,
+    is_cycle::Bool=false,
 )
     """
     Build the lowest-level nonlinear maximization problem
@@ -32,6 +38,7 @@ function build_max_z_lp(
     for all master-problem rows g_i built from:
     - logic rows at each time step
     - power-balance equality split into two inequalities at each time step
+    - SoC lower/upper rows and optional terminal-cycle rows
     - the epigraph row
 
     with u_star, w_star, gamma_star, and sigma_star fixed from upper levels.
@@ -106,12 +113,48 @@ function build_max_z_lp(
             (z[z_idx + 1] - z[z_idx + 2] + u_star_var[u2_idx + 2] - u_star_var[u2_idx + 1] + batt2_net_t - PL_t + s_star_var * PR_t))
     end
 
+    x1 = Vector{Any}(undef, grid_size)
+    x2 = two_batt ? Vector{Any}(undef, grid_size) : Any[]
+    x1[1] = soc0 * n_star_var * e_batt
+    if two_batt
+        x2[1] = soc0 * m_star_var * e_batt
+    end
+    for t in 1:n_t
+        u_idx = u_dim * (t - 1)
+        w_idx = 6 * (t - 1)
+        eta_ch_t = w_star_var[w_idx + 5]
+        rho_dis_t = w_star_var[w_idx + 6]
+        x1[t + 1] = x1[t] + (eta_ch_t * u_star_var[u_idx + 1] - rho_dis_t * u_star_var[u_idx + 2]) * delta_t
+        if two_batt
+            x2[t + 1] = x2[t] + (eta_ch_t * u_star_var[u_idx + 3] - rho_dis_t * u_star_var[u_idx + 4]) * delta_t
+        end
+    end
+
+    for t in 1:grid_size
+        @constraint(model, sigma_bar <= sigma_star_var - ((soc_min * n_star_var * e_batt - x1[t]) / energy_scale))
+        @constraint(model, sigma_bar <= sigma_star_var - ((x1[t] - soc_max * n_star_var * e_batt) / energy_scale))
+        if two_batt
+            @constraint(model, sigma_bar <= sigma_star_var - ((soc_min * m_star_var * e_batt - x2[t]) / energy_scale))
+            @constraint(model, sigma_bar <= sigma_star_var - ((x2[t] - soc_max * m_star_var * e_batt) / energy_scale))
+        end
+    end
+    if is_cycle
+        terminal1 = (x1[grid_size] - soc0 * n_star_var * e_batt) / energy_scale
+        @constraint(model, sigma_bar <= sigma_star_var - terminal1)
+        @constraint(model, sigma_bar <= sigma_star_var + terminal1)
+        if two_batt
+            terminal2 = (x2[grid_size] - soc0 * m_star_var * e_batt) / energy_scale
+            @constraint(model, sigma_bar <= sigma_star_var - terminal2)
+            @constraint(model, sigma_bar <= sigma_star_var + terminal2)
+        end
+    end
+
     battery_count_expr = n_star_var
     if two_batt
         battery_count_expr += m_star_var
     end
     epi_expr = (
-        sum(
+        delta_t * sum(
             w_star_var[6 * (t - 1) + 3] * z[2 * (t - 1) + 1] -
             w_star_var[6 * (t - 1) + 4] * z[2 * (t - 1) + 2]
             for t in 1:n_t
@@ -140,7 +183,12 @@ function build_max_z_lp_fixed(
     battery_cost,
     pv_cost,
     base_pv_capacity_kw,
+    soc0,
+    soc_min,
+    soc_max,
+    delta_t,
     e_batt,
+    energy_scale,
     u_star,
     w_star,
     gamma_star,
@@ -150,6 +198,7 @@ function build_max_z_lp_fixed(
     s_star,
     is_silent;
     two_batt::Bool=true,
+    is_cycle::Bool=false,
 )
     n_t = grid_size - 1
     cost_scale = max(abs(base_pv_capacity_kw * pv_cost), abs(e_batt * battery_cost), 1.0)
@@ -201,8 +250,44 @@ function build_max_z_lp_fixed(
         @constraint(model, sigma_bar <= sigma_star + bal)
     end
 
+    x1 = Vector{Any}(undef, grid_size)
+    x2 = two_batt ? Vector{Any}(undef, grid_size) : Any[]
+    x1[1] = soc0 * n_star * e_batt
+    if two_batt
+        x2[1] = soc0 * m_star * e_batt
+    end
+    for t in 1:n_t
+        u_idx = u_dim * (t - 1)
+        w_idx = 6 * (t - 1)
+        eta_ch_t = w_star[w_idx + 5]
+        rho_dis_t = w_star[w_idx + 6]
+        x1[t + 1] = x1[t] + (eta_ch_t * u_star[u_idx + 1] - rho_dis_t * u_star[u_idx + 2]) * delta_t
+        if two_batt
+            x2[t + 1] = x2[t] + (eta_ch_t * u_star[u_idx + 3] - rho_dis_t * u_star[u_idx + 4]) * delta_t
+        end
+    end
+
+    for t in 1:grid_size
+        @constraint(model, sigma_bar <= sigma_star - ((soc_min * n_star * e_batt - x1[t]) / energy_scale))
+        @constraint(model, sigma_bar <= sigma_star - ((x1[t] - soc_max * n_star * e_batt) / energy_scale))
+        if two_batt
+            @constraint(model, sigma_bar <= sigma_star - ((soc_min * m_star * e_batt - x2[t]) / energy_scale))
+            @constraint(model, sigma_bar <= sigma_star - ((x2[t] - soc_max * m_star * e_batt) / energy_scale))
+        end
+    end
+    if is_cycle
+        terminal1 = (x1[grid_size] - soc0 * n_star * e_batt) / energy_scale
+        @constraint(model, sigma_bar <= sigma_star - terminal1)
+        @constraint(model, sigma_bar <= sigma_star + terminal1)
+        if two_batt
+            terminal2 = (x2[grid_size] - soc0 * m_star * e_batt) / energy_scale
+            @constraint(model, sigma_bar <= sigma_star - terminal2)
+            @constraint(model, sigma_bar <= sigma_star + terminal2)
+        end
+    end
+
     epi_expr = (
-        sum(
+        delta_t * sum(
             w_star[6 * (t - 1) + 3] * z[2 * (t - 1) + 1] -
             w_star[6 * (t - 1) + 4] * z[2 * (t - 1) + 2]
             for t in 1:n_t
