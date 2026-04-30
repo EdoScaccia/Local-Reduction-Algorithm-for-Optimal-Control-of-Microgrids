@@ -136,6 +136,8 @@ function _save_local_reduction_results(
     uncertainty_bounds,
     microgrid_params,
     data_config,
+    termination_reason,
+    last_sigma_star,
 )
     mkpath(results_dir)
     timestamp = Dates.format(now(), "yyyy-mm-dd_HHMMSS")
@@ -168,6 +170,8 @@ function _save_local_reduction_results(
         uncertainty_bounds=uncertainty_bounds,
         microgrid_params=microgrid_params,
         data_config=data_config,
+        termination_reason=termination_reason,
+        last_sigma_star=last_sigma_star,
     )
     return results_path
 end
@@ -209,6 +213,8 @@ function run_local_reduction_nonlinear_existence(
     n_max::Real=100,
     m_max::Real=100,
     s_max::Real=100,
+    scenario_duplicate_tol::Float64=1e-7,
+    stop_after_exact_robust_master::Bool=true,
 )
     """
     Three-level local reduction scaffold for problems with nonlinear existence constraints.
@@ -372,6 +378,7 @@ function run_local_reduction_nonlinear_existence(
             n_max=n_max,
             m_max=m_max,
             s_max=s_max,
+            stop_after_exact_robust_master=stop_after_exact_robust_master,
         )
     end
     u = master_x[:u]
@@ -418,7 +425,24 @@ function run_local_reduction_nonlinear_existence(
     # Build the z maximization problem
     max_z_model = is_milp ?
         nothing :
-        build_max_z(ipopt_lin_solver, max_iter_ipopt, H, h, grid_size, battery_cost, pv_cost, base_pv_capacity_kw, e_batt, is_silent; two_batt=two_batt)
+        build_max_z(
+            ipopt_lin_solver,
+            max_iter_ipopt,
+            H,
+            h,
+            grid_size,
+            battery_cost,
+            pv_cost,
+            base_pv_capacity_kw,
+            soc0,
+            soc_min,
+            soc_max,
+            delta_t,
+            e_batt,
+            is_silent;
+            two_batt=two_batt,
+            is_cycle=is_cycle,
+        )
 
     # Find an initial feasible scenario z and lambda
     z_initial, lambda_initial = find_initial_feasible_scenario_z_lambda(H, h, grid_size, is_silent)
@@ -456,6 +480,8 @@ function run_local_reduction_nonlinear_existence(
     w_scenarios_history[:, scenario_slot] = w_init
     iter_log = NamedTuple[]
     n_master_solves = 0
+    termination_reason = "not_started"
+    last_sigma_star = NaN
     x_block_starts = Vector{Vector{Float64}}()
     solve_stats = Dict(
         :nlp_count => 0,
@@ -487,6 +513,7 @@ function run_local_reduction_nonlinear_existence(
             println("Termination status: ", ts)
             println("Primal status: ", ps)
             println("Stopping local reduction.")
+            termination_reason = "master_solve_status_$(ts)"
             break
         end
 
@@ -508,15 +535,33 @@ function run_local_reduction_nonlinear_existence(
         println("Master solve time: ", round(solve_elapsed; digits=3), " s")
         println()
 
-        # Check if we have reached the maximum number of scenario slots for the master problem
-        if scenario_slot + 1 > k1_slots
-            println("Reached maximum number of scenario slots. Stopping.")
+        if stop_after_exact_robust_master
+            termination_reason = "exact_robust_master_solved"
+            push!(iter_log, (
+                iteration=iter,
+                gamma=gamma_star,
+                sigma=NaN,
+                u_star=u_star,
+                master_x_solve_time=solve_elapsed,
+                scenarios_added_this_iter=0,
+                cumulative_scenarios=scenarios_added,
+                z_scenarios_used=0,
+            ))
+            println("Exact robust microgrid master constraints are enforced; stopping after master solve.")
             println()
             break
         end
 
+        # Check if we have reached the maximum number of scenario slots for the master problem
+        if scenario_slot + 1 > k1_slots
+            println("Reached maximum number of scenario slots. Stopping.")
+            println()
+            termination_reason = "max_master_scenarios_reached"
+            break
+        end
+
         # Run the local reduction subroutine to find a violating scenario w (maximization step)
-        sigma_star, w_star, x_witness, z_scenarios_used,  z_scenarios_history, lambda_scenarios_history = solve_local_red_z_lambda(
+        sigma_star, w_star, x_witness, z_scenarios_used,  z_scenarios_history, lambda_scenarios_history, z_termination_reason = solve_local_red_z_lambda(
                 max_z_model,
                 z_initial, 
                 lambda_initial,
@@ -561,9 +606,29 @@ function run_local_reduction_nonlinear_existence(
                 two_batt=two_batt,
                 is_cycle=is_cycle,
         )
+        last_sigma_star = sigma_star
+
+        if z_termination_reason == "max_z_scenarios_reached"
+            termination_reason = "max_z_scenarios_reached"
+            push!(iter_log, (
+                iteration=iter,
+                gamma=gamma_star,
+                sigma=sigma_star,
+                u_star=u_star,
+                master_x_solve_time=solve_elapsed,
+                scenarios_added_this_iter=0,
+                cumulative_scenarios=scenarios_added,
+                z_scenarios_used=z_scenarios_used,
+            ))
+            println("Inner z/lambda local reduction reached k2_max before certification.")
+            println("Stopping without adding an uncertified outer scenario.")
+            println()
+            break
+        end
 
         # Check constraint violation
         if sigma_star <= tol_1
+            termination_reason = "certified_no_positive_violation"
             push!(iter_log, (
                 iteration=iter,
                 gamma=gamma_star,
@@ -583,6 +648,28 @@ function run_local_reduction_nonlinear_existence(
         println("Z summary | z scenarios used = ", z_scenarios_used)
         if show_w_vec
             println("Z summary | w* = ", w_star)
+        end
+
+        previous_w_distance = minimum(
+            maximum(abs.(w_star .- w_scenarios_history[:, j]))
+            for j in 1:scenario_slot
+        )
+        if previous_w_distance <= scenario_duplicate_tol
+            termination_reason = "duplicate_violating_scenario"
+            push!(iter_log, (
+                iteration=iter,
+                gamma=gamma_star,
+                sigma=sigma_star,
+                u_star=u_star,
+                master_x_solve_time=solve_elapsed,
+                scenarios_added_this_iter=0,
+                cumulative_scenarios=scenarios_added,
+                z_scenarios_used=z_scenarios_used,
+            ))
+            println("Repeated violating scenario already present in MASTER (max |Δw| = ", previous_w_distance, ").")
+            println("Stopping without adding a duplicate scenario; robustness is not certified.")
+            println()
+            break
         end
 
         # Add the new scenario w to the master problem
@@ -724,7 +811,7 @@ function run_local_reduction_nonlinear_existence(
         @constraint(
             master_x,
             (battery_count_var * e_batt * battery_cost + s * base_pv_capacity_kw * pv_cost +
-            sum(
+            delta_t * sum(
                 w_star[6 * (t - 1) + 3] * z_blocks[scenario_slot][2 * (t - 1) + 1] -
                 w_star[6 * (t - 1) + 4] * z_blocks[scenario_slot][2 * (t - 1) + 2]
                 for t in 1:grid_size-1
@@ -804,6 +891,10 @@ function run_local_reduction_nonlinear_existence(
     master_x_solve_time_history_used = master_x_solve_time_history[1:n_master_solves]
     total_elapsed_seconds = time() - total_t0
     print_final_summary(gamma_star, scenarios_added, solve_stats)
+    println("  termination_reason   = ", termination_reason)
+    if isfinite(last_sigma_star)
+        println("  last_sigma_star      = ", last_sigma_star)
+    end
 
     results_path = nothing
     if save_results
@@ -852,6 +943,8 @@ function run_local_reduction_nonlinear_existence(
             uncertainty_bounds,
             microgrid_params,
             data_config,
+            termination_reason,
+            last_sigma_star,
         )
         println("Saved local reduction results to: ", results_path)
     end
@@ -880,6 +973,7 @@ function run_local_reduction_nonlinear_existence(
             n_max=n_max,
             m_max=m_max,
             s_max=s_max,
+            stop_after_exact_robust_master=stop_after_exact_robust_master,
         ),
         scenarios_added=scenarios_added,
         solve_stats=solve_stats,
@@ -893,5 +987,7 @@ function run_local_reduction_nonlinear_existence(
         master_x_solve_time_history=master_x_solve_time_history_used,
         results_path=results_path,
         total_elapsed_seconds=total_elapsed_seconds,
+        termination_reason=termination_reason,
+        last_sigma_star=last_sigma_star,
     )
 end
