@@ -205,6 +205,22 @@ The files most likely to need edits for a one-pack revert are:
 
 ## Running
 
+From the `Revision` folder, activate and instantiate the project environment:
+
+```julia
+import Pkg
+Pkg.activate(".")
+Pkg.instantiate()
+```
+
+or start Julia with:
+
+```bash
+julia --project=.
+```
+
+The project depends on JuMP, Ipopt, HiGHS, Gurobi, SCIP, HSL, JLD2, CSV/DataFrames, and PyPlot. Gurobi and HSL may also require local solver/license setup outside Julia's package manager.
+
 Single run:
 
 ```julia
