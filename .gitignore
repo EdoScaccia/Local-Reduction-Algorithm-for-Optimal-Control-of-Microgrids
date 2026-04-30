@@ -1,6 +1,4 @@
 # Generated local-reduction outputs
-Results/
-*.jld2
 *.jld
 
 # Julia / editor noise
