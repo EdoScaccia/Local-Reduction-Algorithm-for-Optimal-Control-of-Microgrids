@@ -204,6 +204,7 @@ end
 run_kwargs = (
     is_silent=true,
     ipopt_lin_solver="mumps",
+    milp_optimizer="Gurobi",
     max_iter_ipopt=10000,
     save_results=true,
     is_milp=true,
@@ -214,10 +215,10 @@ run_kwargs = (
     m_max=100,
     s_max=100,
     horizon_days=1,
-    grid_power_factor=0.6,
+    grid_power_factor=0.4,
     soc0=0.6,
-    k1_max=5,
-    k2_max=50,
+    k1_max=10,
+    k2_max=20,
 )
 
 res = run_local_reduction_nonlinear_existence(; run_kwargs...)

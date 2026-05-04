@@ -30,6 +30,7 @@ function solve_master_z_with_restarts!(master_z, s_blocks, z_scenarios_used, n_r
     # Initialize the best solution tracking variables
     best_obj = -Inf
     best_w = nothing
+    best_z = nothing
     best_x = nothing
     best_s_blocks = nothing
     best_sigma = nothing
@@ -78,6 +79,7 @@ function solve_master_z_with_restarts!(master_z, s_blocks, z_scenarios_used, n_r
             if obj > best_obj
                 best_obj = obj
                 best_w = value.(master_z[:w])[:, 1]
+                best_z = value.(master_z[:z])
                 best_x = value.(master_z[:x])
                 best_s_blocks = [value.(s_blocks[k]) for k in 1:z_scenarios_used]
                 best_sigma = value(master_z[:sigma])
@@ -93,6 +95,9 @@ function solve_master_z_with_restarts!(master_z, s_blocks, z_scenarios_used, n_r
     for i in axes(best_w, 1)
         set_start_value(master_z[:w][i, 1], best_w[i])
     end
+    for i in eachindex(best_z)
+        set_start_value(master_z[:z][i], best_z[i])
+    end
     for k in 1:z_scenarios_used
         for i in eachindex(best_s_blocks[k])
             set_start_value(s_blocks[k][i], best_s_blocks[k][i])
@@ -100,5 +105,5 @@ function solve_master_z_with_restarts!(master_z, s_blocks, z_scenarios_used, n_r
     end
     set_start_value(master_z[:sigma], best_sigma)
 
-    return best_obj, best_w, best_x
+    return best_obj, best_w, best_z, best_x
 end

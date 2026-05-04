@@ -193,8 +193,10 @@ function build_master_problem(
         model,
         (battery_count * e_batt * battery_cost + s * base_pv_capacity_kw * pv_cost +
         sum(
-            w_init[6 * (t - 1) + 3] * z_blocks[1][2 * (t - 1) + 1] -
-            w_init[6 * (t - 1) + 4] * z_blocks[1][2 * (t - 1) + 2]
+            delta_t * (
+                w_init[6 * (t - 1) + 3] * z_blocks[1][2 * (t - 1) + 1] -
+                w_init[6 * (t - 1) + 4] * z_blocks[1][2 * (t - 1) + 2]
+            )
             for t in 1:grid_size-1
         ) - gamma) / cost_scale <= 0
     )

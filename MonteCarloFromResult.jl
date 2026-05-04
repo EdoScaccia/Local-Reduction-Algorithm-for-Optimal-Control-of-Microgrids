@@ -4,12 +4,12 @@ using PyPlot
 
 include("load_problem_data.jl")
 
-result_path = joinpath(@__DIR__, "Results", "MILP_SOC060_H1_PG100_B1_2026-04-28_123251.jld2")
+result_path = joinpath(@__DIR__, "Results", "MILP_SOC060_H1_PG60_B1_2026-05-04_115723.jld2")
 
 # Leave as `nothing` to use the last finite saved solution.
 # Set to an integer, e.g. `selected_solution_idx = 3`, to replay a specific
 # column of `u_star_history` and `master_x_obj_history`.
-selected_solution_idx = 5
+selected_solution_idx = 2
 
 function _last_finite_col(matrix)
     for j in size(matrix, 2):-1:1
@@ -516,7 +516,8 @@ function run_monte_carlo_from_result(result_path::AbstractString; n_scenarios::I
     terminal_soc_violation_counts = is_cycle ? Float64.(terminal_soc1_violation .> 1e-7) : zeros(total_scenarios)
     terminal_soc_violation_counts .+= (is_cycle && two_batt) ? Float64.(terminal_soc2_violation .> 1e-7) : zeros(total_scenarios)
 
-    operating_costs = vec(sum(C_buy .* PG_plus .- C_sell .* PG_minus; dims=1))
+    delta_t = microgrid_params["Δt"]
+    operating_costs = vec(sum(delta_t .* (C_buy .* PG_plus .- C_sell .* PG_minus); dims=1))
     e_batt = microgrid_params["E_BATT"]
     battery_cost = _param_value(result_data, microgrid_params, "battery_cost"; aliases=["Battery_Cost"], default=200.0)
     pv_cost = _param_value(result_data, microgrid_params, "pv_cost"; aliases=["PV_Cost"], default=1500.0)

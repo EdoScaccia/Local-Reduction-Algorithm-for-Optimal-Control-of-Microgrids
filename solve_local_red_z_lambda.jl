@@ -19,6 +19,7 @@ function _z_master_g_row_values(
     pv_cost,
     base_pv_capacity_kw,
     e_batt;
+    delta_t=1.0,
     two_batt::Bool=true,
 )
     u_dim = two_batt ? 4 : 2
@@ -32,27 +33,24 @@ function _z_master_g_row_values(
         u_idx = u_dim * (t - 1)
         z_idx = 2 * (t - 1)
         l_idx = l_dim_per_t * (t - 1)
-
-        PL_t = w_scenario[w_idx + 1]
-        PR_t = w_scenario[w_idx + 2]
-
         push!(g_values, lambda_scenario[l_idx + 1] * u_star[u_idx + 1] + lambda_scenario[l_idx + 2] * u_star[u_idx + 2])
         push!(g_values, lambda_scenario[l_idx + 3] * z_scenario[z_idx + 1] + lambda_scenario[l_idx + 4] * z_scenario[z_idx + 2])
         if two_batt
             push!(g_values, lambda_scenario[l_idx + 5] * u_star[u_idx + 3] + lambda_scenario[l_idx + 6] * u_star[u_idx + 4])
         end
-
-        g_bal_plus_t = z_scenario[z_idx + 1] - z_scenario[z_idx + 2] + u_star[u_idx + 2] - u_star[u_idx + 1] + (two_batt ? u_star[u_idx + 4] - u_star[u_idx + 3] : 0.0) - PL_t + s_star * PR_t
-        push!(g_values, g_bal_plus_t)
-        push!(g_values, -g_bal_plus_t)
     end
 
-    g_epi = sum(
-        w_scenario[6 * (t - 1) + 3] * z_scenario[2 * (t - 1) + 1] -
-        w_scenario[6 * (t - 1) + 4] * z_scenario[2 * (t - 1) + 2]
-        for t in 1:n_t
-    ) + (n_star + (two_batt ? m_star : 0.0)) * e_batt * battery_cost + s_star * base_pv_capacity_kw * pv_cost - gamma_star
-    g_epi /= cost_scale
+    g_epi = (
+        (n_star + (two_batt ? m_star : 0.0)) * e_batt * battery_cost +
+        s_star * base_pv_capacity_kw * pv_cost +
+        sum(
+            delta_t * (
+                w_scenario[6 * (t - 1) + 3] * z_scenario[2 * (t - 1) + 1] -
+                w_scenario[6 * (t - 1) + 4] * z_scenario[2 * (t - 1) + 2]
+            )
+            for t in 1:n_t
+        ) - gamma_star
+    ) / cost_scale
     push!(g_values, g_epi)
 
     return g_values
@@ -69,6 +67,136 @@ function _push_milp_row!(g_rows, g_lbs, g_ubs, expr, lb, ub)
     push!(g_rows, expr)
     push!(g_lbs, Float64(lb))
     push!(g_ubs, Float64(ub))
+    return nothing
+end
+
+function _z_minus_value(z_scenario, t)
+    return z_scenario[2 * (t - 1) + 2]
+end
+
+function _add_master_z_balance_constraints!(
+    master_z,
+    z,
+    w,
+    z_minus_scenario,
+    u_star,
+    s_star;
+    two_batt::Bool=true,
+)
+    u_dim = two_batt ? 4 : 2
+    n_t = div(length(u_star), u_dim)
+    for t in 1:n_t
+        w_idx = 6 * (t - 1)
+        u_idx = u_dim * (t - 1)
+        z_idx = 2 * (t - 1)
+        batt2_net_t = two_batt ? u_star[u_idx + 4] - u_star[u_idx + 3] : 0.0
+        @constraint(master_z, z[z_idx + 2] == _z_minus_value(z_minus_scenario, t))
+        @constraint(
+            master_z,
+            z[z_idx + 1] - z[z_idx + 2] +
+            u_star[u_idx + 2] - u_star[u_idx + 1] + batt2_net_t -
+            w[w_idx + 1, 1] + s_star * w[w_idx + 2, 1] == 0
+        )
+    end
+    return nothing
+end
+
+function _build_master_z_selector_rows!(
+    g_rows,
+    g_lbs,
+    g_ubs,
+    w,
+    z,
+    z_minus_scenario,
+    lambda_scenario,
+    u_star,
+    gamma_star,
+    w_lb,
+    w_ub,
+    pc_max,
+    pd_max,
+    pg_max,
+    n_max,
+    m_max,
+    n_star,
+    m_star,
+    s_star,
+    battery_cost,
+    pv_cost,
+    base_pv_capacity_kw,
+    delta_t,
+    e_batt,
+    cost_scale;
+    is_milp::Bool=false,
+    two_batt::Bool=true,
+)
+    u_dim = two_batt ? 4 : 2
+    nlp_l_dim_per_t = two_batt ? 6 : 4
+    milp_l_dim_per_t = two_batt ? 3 : 2
+    n_t = div(length(u_star), u_dim)
+
+    for t in 1:n_t
+        u_idx = u_dim * (t - 1)
+        w_idx = 6 * (t - 1)
+        z_idx = 2 * (t - 1)
+        z_minus_t = _z_minus_value(z_minus_scenario, t)
+
+        if is_milp
+            l_idx = milp_l_dim_per_t * (t - 1)
+            _push_milp_row!(g_rows, g_lbs, g_ubs, -u_star[u_idx + 1], -u_star[u_idx + 1], -u_star[u_idx + 1])
+            _push_milp_row!(g_rows, g_lbs, g_ubs, u_star[u_idx + 1] - n_max * pc_max * lambda_scenario[l_idx + 1], u_star[u_idx + 1] - n_max * pc_max * lambda_scenario[l_idx + 1], u_star[u_idx + 1] - n_max * pc_max * lambda_scenario[l_idx + 1])
+            _push_milp_row!(g_rows, g_lbs, g_ubs, -u_star[u_idx + 2], -u_star[u_idx + 2], -u_star[u_idx + 2])
+            _push_milp_row!(g_rows, g_lbs, g_ubs, u_star[u_idx + 2] - n_max * pd_max * (1 - lambda_scenario[l_idx + 1]), u_star[u_idx + 2] - n_max * pd_max * (1 - lambda_scenario[l_idx + 1]), u_star[u_idx + 2] - n_max * pd_max * (1 - lambda_scenario[l_idx + 1]))
+            if two_batt
+                _push_milp_row!(g_rows, g_lbs, g_ubs, -u_star[u_idx + 3], -u_star[u_idx + 3], -u_star[u_idx + 3])
+                _push_milp_row!(g_rows, g_lbs, g_ubs, u_star[u_idx + 3] - m_max * pc_max * lambda_scenario[l_idx + 2], u_star[u_idx + 3] - m_max * pc_max * lambda_scenario[l_idx + 2], u_star[u_idx + 3] - m_max * pc_max * lambda_scenario[l_idx + 2])
+                _push_milp_row!(g_rows, g_lbs, g_ubs, -u_star[u_idx + 4], -u_star[u_idx + 4], -u_star[u_idx + 4])
+                _push_milp_row!(g_rows, g_lbs, g_ubs, u_star[u_idx + 4] - m_max * pd_max * (1 - lambda_scenario[l_idx + 2]), u_star[u_idx + 4] - m_max * pd_max * (1 - lambda_scenario[l_idx + 2]), u_star[u_idx + 4] - m_max * pd_max * (1 - lambda_scenario[l_idx + 2]))
+            end
+            grid_l = l_idx + (two_batt ? 3 : 2)
+            _push_milp_row!(g_rows, g_lbs, g_ubs, -z[z_idx + 1], -pg_max, 0.0)
+            _push_milp_row!(g_rows, g_lbs, g_ubs, z[z_idx + 1] - pg_max * lambda_scenario[grid_l], -pg_max * lambda_scenario[grid_l], pg_max * (1 - lambda_scenario[grid_l]))
+            _push_milp_row!(g_rows, g_lbs, g_ubs, -z_minus_t, -z_minus_t, -z_minus_t)
+            _push_milp_row!(g_rows, g_lbs, g_ubs, z_minus_t - pg_max * (1 - lambda_scenario[grid_l]), z_minus_t - pg_max * (1 - lambda_scenario[grid_l]), z_minus_t - pg_max * (1 - lambda_scenario[grid_l]))
+        else
+            l_idx = nlp_l_dim_per_t * (t - 1)
+            push!(g_rows, lambda_scenario[l_idx + 1] * u_star[u_idx + 1] + lambda_scenario[l_idx + 2] * u_star[u_idx + 2])
+            push!(g_rows, lambda_scenario[l_idx + 3] * z[z_idx + 1] + lambda_scenario[l_idx + 4] * z_minus_t)
+            if two_batt
+                push!(g_rows, lambda_scenario[l_idx + 5] * u_star[u_idx + 3] + lambda_scenario[l_idx + 6] * u_star[u_idx + 4])
+            end
+        end
+    end
+
+    investment_cost = (n_star + (two_batt ? m_star : 0.0)) * e_batt * battery_cost + s_star * base_pv_capacity_kw * pv_cost
+    epigraph_row = (
+        investment_cost +
+        sum(
+            delta_t * (
+                w[6 * (t - 1) + 3, 1] * z[2 * (t - 1) + 1] -
+                w[6 * (t - 1) + 4, 1] * _z_minus_value(z_minus_scenario, t)
+            )
+            for t in 1:n_t
+        ) - gamma_star
+    ) / cost_scale
+    push!(g_rows, epigraph_row)
+
+    if is_milp
+        epi_lb = investment_cost - gamma_star
+        epi_ub = investment_cost - gamma_star
+        for t in 1:n_t
+            z_minus_t = _z_minus_value(z_minus_scenario, t)
+            buy_lb = min(0.0, w_lb[6 * (t - 1) + 3] * pg_max, w_ub[6 * (t - 1) + 3] * pg_max)
+            buy_ub = max(0.0, w_lb[6 * (t - 1) + 3] * pg_max, w_ub[6 * (t - 1) + 3] * pg_max)
+            sell_lb = min(-w_lb[6 * (t - 1) + 4] * z_minus_t, -w_ub[6 * (t - 1) + 4] * z_minus_t)
+            sell_ub = max(-w_lb[6 * (t - 1) + 4] * z_minus_t, -w_ub[6 * (t - 1) + 4] * z_minus_t)
+            epi_lb += delta_t * (buy_lb + sell_lb)
+            epi_ub += delta_t * (buy_ub + sell_ub)
+        end
+        push!(g_lbs, epi_lb / cost_scale)
+        push!(g_ubs, epi_ub / cost_scale)
+    end
+
     return nothing
 end
 
@@ -143,8 +271,8 @@ function solve_local_red_z_lambda(
     u_dim = two_batt ? 4 : 2
     nlp_l_dim_per_t = two_batt ? 6 : 4
     milp_l_dim_per_t = two_batt ? 3 : 2
-    nlp_rows_per_t = two_batt ? 5 : 4
-    milp_rows_per_t = two_batt ? 14 : 10
+    nlp_rows_per_t = two_batt ? 3 : 2
+    milp_rows_per_t = two_batt ? 12 : 8
     s_blocks = Vector{Vector{VariableRef}}(undef, k2_max)
     # Build master z problem (used to solve for z in the local reduction subroutine)
     ypad = "    "
@@ -155,12 +283,16 @@ function solve_local_red_z_lambda(
             grid_size,
             P,
             p,
+            H,
+            h,
+            k2_max,
             soc0,
             soc_min,
             soc_max,
             n_star,
             m_star,
             u_star,
+            s_star,
             delta_t,
             e_batt,
             is_silent,
@@ -174,12 +306,16 @@ function solve_local_red_z_lambda(
             grid_size,
             P,
             p,
+            H,
+            h,
+            k2_max,
             soc0,
             soc_min,
             soc_max,
             n_star,
             m_star,
             u_star,
+            s_star,
             delta_t,
             e_batt,
             is_silent,
@@ -201,80 +337,44 @@ function solve_local_red_z_lambda(
     g_lbs = Float64[]
     g_ubs = Float64[]
     scenario_sigma_ubs = Float64[]
-    for t in 1:n_t
-        w_idx = 6 * (t - 1)
-        u_idx = u_dim * (t - 1)
-        z_idx = 2 * (t - 1)
-        PL_t = w[w_idx + 1, 1]
-        PR_t = w[w_idx + 2, 1]
-
-        if is_milp
-            l_idx = milp_l_dim_per_t * (t - 1)
-            _push_milp_row!(g_rows, g_lbs, g_ubs, -u_star[u_idx + 1], -u_star[u_idx + 1], -u_star[u_idx + 1])
-            _push_milp_row!(g_rows, g_lbs, g_ubs, u_star[u_idx + 1] - n_max * pc_max * lambda_initial[l_idx + 1], u_star[u_idx + 1] - n_max * pc_max * lambda_initial[l_idx + 1], u_star[u_idx + 1] - n_max * pc_max * lambda_initial[l_idx + 1])
-            _push_milp_row!(g_rows, g_lbs, g_ubs, -u_star[u_idx + 2], -u_star[u_idx + 2], -u_star[u_idx + 2])
-            _push_milp_row!(g_rows, g_lbs, g_ubs, u_star[u_idx + 2] - n_max * pd_max * (1 - lambda_initial[l_idx + 1]), u_star[u_idx + 2] - n_max * pd_max * (1 - lambda_initial[l_idx + 1]), u_star[u_idx + 2] - n_max * pd_max * (1 - lambda_initial[l_idx + 1]))
-            if two_batt
-                _push_milp_row!(g_rows, g_lbs, g_ubs, -u_star[u_idx + 3], -u_star[u_idx + 3], -u_star[u_idx + 3])
-                _push_milp_row!(g_rows, g_lbs, g_ubs, u_star[u_idx + 3] - m_max * pc_max * lambda_initial[l_idx + 2], u_star[u_idx + 3] - m_max * pc_max * lambda_initial[l_idx + 2], u_star[u_idx + 3] - m_max * pc_max * lambda_initial[l_idx + 2])
-                _push_milp_row!(g_rows, g_lbs, g_ubs, -u_star[u_idx + 4], -u_star[u_idx + 4], -u_star[u_idx + 4])
-                _push_milp_row!(g_rows, g_lbs, g_ubs, u_star[u_idx + 4] - m_max * pd_max * (1 - lambda_initial[l_idx + 2]), u_star[u_idx + 4] - m_max * pd_max * (1 - lambda_initial[l_idx + 2]), u_star[u_idx + 4] - m_max * pd_max * (1 - lambda_initial[l_idx + 2]))
-            end
-            grid_l = l_idx + (two_batt ? 3 : 2)
-            _push_milp_row!(g_rows, g_lbs, g_ubs, -z_initial[z_idx + 1], -z_initial[z_idx + 1], -z_initial[z_idx + 1])
-            _push_milp_row!(g_rows, g_lbs, g_ubs, z_initial[z_idx + 1] - pg_max * lambda_initial[grid_l], z_initial[z_idx + 1] - pg_max * lambda_initial[grid_l], z_initial[z_idx + 1] - pg_max * lambda_initial[grid_l])
-            _push_milp_row!(g_rows, g_lbs, g_ubs, -z_initial[z_idx + 2], -z_initial[z_idx + 2], -z_initial[z_idx + 2])
-            _push_milp_row!(g_rows, g_lbs, g_ubs, z_initial[z_idx + 2] - pg_max * (1 - lambda_initial[grid_l]), z_initial[z_idx + 2] - pg_max * (1 - lambda_initial[grid_l]), z_initial[z_idx + 2] - pg_max * (1 - lambda_initial[grid_l]))
-        else
-            l_idx = nlp_l_dim_per_t * (t - 1)
-            # Logic rows
-            push!(g_rows, lambda_initial[l_idx + 1] * u_star[u_idx + 1] + lambda_initial[l_idx + 2] * u_star[u_idx + 2])
-            push!(g_rows, lambda_initial[l_idx + 3] * z_initial[z_idx + 1] + lambda_initial[l_idx + 4] * z_initial[z_idx + 2])
-            if two_batt
-                push!(g_rows, lambda_initial[l_idx + 5] * u_star[u_idx + 3] + lambda_initial[l_idx + 6] * u_star[u_idx + 4])
-            end
-        end
-
-        # Load-balance equality split into two inequalities
-        g_bal_plus_t = z_initial[z_idx + 1] - z_initial[z_idx + 2] + u_star[u_idx + 2] - u_star[u_idx + 1] + (two_batt ? u_star[u_idx + 4] - u_star[u_idx + 3] : 0.0) - PL_t + s_star * PR_t
-        push!(g_rows, g_bal_plus_t)
-        push!(g_rows, -g_bal_plus_t)
-        if is_milp
-            bal_const = z_initial[z_idx + 1] - z_initial[z_idx + 2] + u_star[u_idx + 2] - u_star[u_idx + 1] + (two_batt ? u_star[u_idx + 4] - u_star[u_idx + 3] : 0.0)
-            bal_lb = bal_const - w_ub[w_idx + 1] + s_star * w_lb[w_idx + 2]
-            bal_ub = bal_const - w_lb[w_idx + 1] + s_star * w_ub[w_idx + 2]
-            append!(g_lbs, [bal_lb, -bal_ub])
-            append!(g_ubs, [bal_ub, -bal_lb])
-        end
-    end
-
-    # Epigraph row
-    g_epi = sum(
-        w[6 * (t - 1) + 3, 1] * z_initial[2 * (t - 1) + 1] -
-        w[6 * (t - 1) + 4, 1] * z_initial[2 * (t - 1) + 2]
-        for t in 1:n_t
-    ) + (n_star + (two_batt ? m_star : 0.0)) * e_batt * battery_cost + s_star * base_pv_capacity_kw * pv_cost - gamma_star
-    g_epi /= cost_scale
-    push!(g_rows, g_epi)
-    if is_milp
-        epi_fixed = (n_star + (two_batt ? m_star : 0.0)) * e_batt * battery_cost + s_star * base_pv_capacity_kw * pv_cost - gamma_star
-        epi_lb = (
-            sum(
-                w_lb[6 * (t - 1) + 3] * z_initial[2 * (t - 1) + 1] -
-                w_ub[6 * (t - 1) + 4] * z_initial[2 * (t - 1) + 2]
-                for t in 1:n_t
-            ) + epi_fixed
-        ) / cost_scale
-        epi_ub = (
-            sum(
-                w_ub[6 * (t - 1) + 3] * z_initial[2 * (t - 1) + 1] -
-                w_lb[6 * (t - 1) + 4] * z_initial[2 * (t - 1) + 2]
-                for t in 1:n_t
-            ) + epi_fixed
-        ) / cost_scale
-        push!(g_lbs, epi_lb)
-        push!(g_ubs, epi_ub)
-    end
+    _add_master_z_balance_constraints!(
+        master_z,
+        master_z[:z][:, 1],
+        w,
+        z_initial,
+        u_star,
+        s_star,
+        two_batt=two_batt,
+    )
+    _build_master_z_selector_rows!(
+        g_rows,
+        g_lbs,
+        g_ubs,
+        w,
+        master_z[:z][:, 1],
+        z_initial,
+        lambda_initial,
+        u_star,
+        gamma_star,
+        w_lb,
+        w_ub,
+        pc_max,
+        pd_max,
+        pg_max,
+        n_max,
+        m_max,
+        n_star,
+        m_star,
+        s_star,
+        battery_cost,
+        pv_cost,
+        base_pv_capacity_kw,
+        delta_t,
+        e_batt,
+        cost_scale,
+        is_milp=is_milp,
+        two_batt=two_batt,
+    )
 
     if length(g_rows) != n_rows_s
         error("Mismatch in number of g_i rows: expected $n_rows_s, got $(length(g_rows)).")
@@ -294,6 +394,7 @@ function solve_local_red_z_lambda(
     # Initialze variables
     sigma_star = 0.0
     w_star = zeros(size(P, 2))
+    z_star = copy(z_initial)
     z_scenarios_used = 1
     sigma_bar_star = 0.0
     x_witness = zeros((two_batt ? 2 : 1) * grid_size)
@@ -314,6 +415,7 @@ function solve_local_red_z_lambda(
             pv_cost,
             base_pv_capacity_kw,
             e_batt,
+            delta_t=delta_t,
             two_batt=two_batt,
         ),
         )
@@ -330,6 +432,7 @@ function solve_local_red_z_lambda(
         m_star,
         delta_t,
         e_batt,
+        z_witness=z_initial,
         sigma_start=sigma_star,
         s_start_vectors=s_start_vectors,
         two_batt=two_batt,
@@ -342,7 +445,7 @@ function solve_local_red_z_lambda(
         z_iter += 1
         # Solve the master z problem for a fixed number of restarts to obtain a better local solution
         n_z_master_solves = is_milp ? 1 : z_master_restarts
-        sigma_star, w_star, x_witness = solve_master_z_with_restarts!(
+        sigma_star, w_star, z_star, x_witness = solve_master_z_with_restarts!(
             master_z,
             s_blocks,
             z_scenarios_used,
@@ -374,9 +477,11 @@ function solve_local_red_z_lambda(
                 battery_cost,
                 pv_cost,
                 base_pv_capacity_kw,
+                delta_t,
                 e_batt,
                 u_star,
                 w_star,
+                z_star,
                 gamma_star,
                 sigma_star,
                 n_star,
@@ -404,8 +509,8 @@ function solve_local_red_z_lambda(
             solve_stats[:nlp_count] += 1
             solve_stats[:nlp_time] += solve_elapsed
         end
-        z_star = value.(max_z_model[:z])
         lambda_star = value.(max_z_model[:lambda])
+        z_star = value.(max_z_model[:z])
         sigma_bar_star = objective_value(max_z_model)
 
         if show_z_iter
@@ -431,80 +536,44 @@ function solve_local_red_z_lambda(
             g_rows = Any[]
             g_lbs = Float64[]
             g_ubs = Float64[]
-            for t in 1:n_t
-                w_idx = 6 * (t - 1)
-                u_idx = u_dim * (t - 1)
-                z_idx = 2 * (t - 1)
-                PL_t = w[w_idx + 1, 1]
-                PR_t = w[w_idx + 2, 1]
-
-                if is_milp
-                    l_idx = milp_l_dim_per_t * (t - 1)
-                    _push_milp_row!(g_rows, g_lbs, g_ubs, -u_star[u_idx + 1], -u_star[u_idx + 1], -u_star[u_idx + 1])
-                    _push_milp_row!(g_rows, g_lbs, g_ubs, u_star[u_idx + 1] - n_max * pc_max * lambda_star[l_idx + 1], u_star[u_idx + 1] - n_max * pc_max * lambda_star[l_idx + 1], u_star[u_idx + 1] - n_max * pc_max * lambda_star[l_idx + 1])
-                    _push_milp_row!(g_rows, g_lbs, g_ubs, -u_star[u_idx + 2], -u_star[u_idx + 2], -u_star[u_idx + 2])
-                    _push_milp_row!(g_rows, g_lbs, g_ubs, u_star[u_idx + 2] - n_max * pd_max * (1 - lambda_star[l_idx + 1]), u_star[u_idx + 2] - n_max * pd_max * (1 - lambda_star[l_idx + 1]), u_star[u_idx + 2] - n_max * pd_max * (1 - lambda_star[l_idx + 1]))
-                    if two_batt
-                        _push_milp_row!(g_rows, g_lbs, g_ubs, -u_star[u_idx + 3], -u_star[u_idx + 3], -u_star[u_idx + 3])
-                        _push_milp_row!(g_rows, g_lbs, g_ubs, u_star[u_idx + 3] - m_max * pc_max * lambda_star[l_idx + 2], u_star[u_idx + 3] - m_max * pc_max * lambda_star[l_idx + 2], u_star[u_idx + 3] - m_max * pc_max * lambda_star[l_idx + 2])
-                        _push_milp_row!(g_rows, g_lbs, g_ubs, -u_star[u_idx + 4], -u_star[u_idx + 4], -u_star[u_idx + 4])
-                        _push_milp_row!(g_rows, g_lbs, g_ubs, u_star[u_idx + 4] - m_max * pd_max * (1 - lambda_star[l_idx + 2]), u_star[u_idx + 4] - m_max * pd_max * (1 - lambda_star[l_idx + 2]), u_star[u_idx + 4] - m_max * pd_max * (1 - lambda_star[l_idx + 2]))
-                    end
-                    grid_l = l_idx + (two_batt ? 3 : 2)
-                    _push_milp_row!(g_rows, g_lbs, g_ubs, -z_star[z_idx + 1], -z_star[z_idx + 1], -z_star[z_idx + 1])
-                    _push_milp_row!(g_rows, g_lbs, g_ubs, z_star[z_idx + 1] - pg_max * lambda_star[grid_l], z_star[z_idx + 1] - pg_max * lambda_star[grid_l], z_star[z_idx + 1] - pg_max * lambda_star[grid_l])
-                    _push_milp_row!(g_rows, g_lbs, g_ubs, -z_star[z_idx + 2], -z_star[z_idx + 2], -z_star[z_idx + 2])
-                    _push_milp_row!(g_rows, g_lbs, g_ubs, z_star[z_idx + 2] - pg_max * (1 - lambda_star[grid_l]), z_star[z_idx + 2] - pg_max * (1 - lambda_star[grid_l]), z_star[z_idx + 2] - pg_max * (1 - lambda_star[grid_l]))
-                else
-                    l_idx = nlp_l_dim_per_t * (t - 1)
-                    # Logic rows
-                    push!(g_rows, lambda_star[l_idx + 1] * u_star[u_idx + 1] + lambda_star[l_idx + 2] * u_star[u_idx + 2])
-                    push!(g_rows, lambda_star[l_idx + 3] * z_star[z_idx + 1] + lambda_star[l_idx + 4] * z_star[z_idx + 2])
-                    if two_batt
-                        push!(g_rows, lambda_star[l_idx + 5] * u_star[u_idx + 3] + lambda_star[l_idx + 6] * u_star[u_idx + 4])
-                    end
-                end
-
-                # Load-balance equality split into two inequalities
-                g_bal_plus_t = z_star[z_idx + 1] - z_star[z_idx + 2] + u_star[u_idx + 2] - u_star[u_idx + 1] + (two_batt ? u_star[u_idx + 4] - u_star[u_idx + 3] : 0.0) - PL_t + s_star * PR_t
-                push!(g_rows, g_bal_plus_t)
-                push!(g_rows, -g_bal_plus_t)
-                if is_milp
-                    bal_const = z_star[z_idx + 1] - z_star[z_idx + 2] + u_star[u_idx + 2] - u_star[u_idx + 1] + (two_batt ? u_star[u_idx + 4] - u_star[u_idx + 3] : 0.0)
-                    bal_lb = bal_const - w_ub[w_idx + 1] + s_star * w_lb[w_idx + 2]
-                    bal_ub = bal_const - w_lb[w_idx + 1] + s_star * w_ub[w_idx + 2]
-                    append!(g_lbs, [bal_lb, -bal_ub])
-                    append!(g_ubs, [bal_ub, -bal_lb])
-                end
-            end
-
-            # Epigraph row
-            g_epi = sum(
-                w[6 * (t - 1) + 3, 1] * z_star[2 * (t - 1) + 1] -
-                w[6 * (t - 1) + 4, 1] * z_star[2 * (t - 1) + 2]
-                for t in 1:n_t
-            ) + (n_star + (two_batt ? m_star : 0.0)) * e_batt * battery_cost + s_star * base_pv_capacity_kw * pv_cost - gamma_star
-            g_epi /= cost_scale
-            push!(g_rows, g_epi)
-            if is_milp
-                epi_fixed = (n_star + (two_batt ? m_star : 0.0)) * e_batt * battery_cost + s_star * base_pv_capacity_kw * pv_cost - gamma_star
-                epi_lb = (
-                    sum(
-                        w_lb[6 * (t - 1) + 3] * z_star[2 * (t - 1) + 1] -
-                        w_ub[6 * (t - 1) + 4] * z_star[2 * (t - 1) + 2]
-                        for t in 1:n_t
-                    ) + epi_fixed
-                ) / cost_scale
-                epi_ub = (
-                    sum(
-                        w_ub[6 * (t - 1) + 3] * z_star[2 * (t - 1) + 1] -
-                        w_lb[6 * (t - 1) + 4] * z_star[2 * (t - 1) + 2]
-                        for t in 1:n_t
-                    ) + epi_fixed
-                ) / cost_scale
-                push!(g_lbs, epi_lb)
-                push!(g_ubs, epi_ub)
-            end
+            _add_master_z_balance_constraints!(
+                master_z,
+                master_z[:z][:, z_scenarios_used + 1],
+                w,
+                z_star,
+                u_star,
+                s_star,
+                two_batt=two_batt,
+            )
+            _build_master_z_selector_rows!(
+                g_rows,
+                g_lbs,
+                g_ubs,
+                w,
+                master_z[:z][:, z_scenarios_used + 1],
+                z_star,
+                lambda_star,
+                u_star,
+                gamma_star,
+                w_lb,
+                w_ub,
+                pc_max,
+                pd_max,
+                pg_max,
+                n_max,
+                m_max,
+                n_star,
+                m_star,
+                s_star,
+                battery_cost,
+                pv_cost,
+                base_pv_capacity_kw,
+                delta_t,
+                e_batt,
+                cost_scale,
+                is_milp=is_milp,
+                two_batt=two_batt,
+            )
 
             if length(g_rows) != n_rows_s
                 error("Mismatch in number of g_i rows: expected $n_rows_s, got $(length(g_rows)).")
@@ -540,6 +609,7 @@ function solve_local_red_z_lambda(
                         pv_cost,
                         base_pv_capacity_kw,
                         e_batt,
+                        delta_t=delta_t,
                         two_batt=two_batt,
                     ),
                 )
@@ -558,6 +628,7 @@ function solve_local_red_z_lambda(
                 e_batt,
                 w_start=w_star,
                 x_witness=x_witness,
+                z_witness=z_star,
                 sigma_start=sigma_star,
                 s_start_vectors=s_start_vectors,
                 two_batt=two_batt,

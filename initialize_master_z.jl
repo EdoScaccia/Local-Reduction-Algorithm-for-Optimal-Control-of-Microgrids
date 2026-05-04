@@ -14,6 +14,7 @@ function initialize_master_z!(
     e_batt;
     w_start=nothing,
     x_witness=nothing,
+    z_witness=nothing,
     sigma_start=0.0,
     s_start_vectors=nothing,
     two_batt::Bool=true,
@@ -33,6 +34,19 @@ function initialize_master_z!(
 
     for i in 1:n_rows_w
         set_start_value(master_z[:w][i, 1], w_init[i])
+    end
+
+    if haskey(object_dictionary(master_z), :z)
+        z_dim = length(master_z[:z])
+        if z_witness !== nothing && length(z_witness) == z_dim
+            for i in 1:z_dim
+                set_start_value(master_z[:z][i], max(z_witness[i], 0.0))
+            end
+        elseif any(v -> start_value(v) === nothing, master_z[:z])
+            for i in 1:z_dim
+                set_start_value(master_z[:z][i], 0.0)
+            end
+        end
     end
 
     grid_size = n_t + 1

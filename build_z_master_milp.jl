@@ -10,12 +10,16 @@ function build_z_master_milp(
     grid_size,
     P,
     p,
+    H,
+    h,
+    k2_max,
     soc0,
     soc_min,
     soc_max,
     n_star,
     m_star,
     u_star,
+    s_star,
     delta_t,
     e_batt,
     is_silent;
@@ -40,7 +44,7 @@ function build_z_master_milp(
     n_t = grid_size - 1
     u_dim = two_batt ? 4 : 2
     n_logic_rows = two_batt ? 12 : 8
-    n_rows_s = (n_logic_rows + 2) * n_t + 1
+    n_rows_s = n_logic_rows * n_t + 1
     w_ub = p[1:n_rows_w]
     w_lb = -p[n_rows_w + 1:2 * n_rows_w]
     w_mid = 0.5 .* (w_lb .+ w_ub)
@@ -49,6 +53,7 @@ function build_z_master_milp(
     # Create Ipopt model
     if milp_optimizer == "Gurobi"
         model = Model(Gurobi.Optimizer)
+        set_optimizer_attribute(model, "NonConvex", 2)
     elseif milp_optimizer == "SCIP"
         model = Model(SCIP.Optimizer)
     else
@@ -60,6 +65,7 @@ function build_z_master_milp(
 
     # Create variables.
     @variable(model, w[1:n_rows_w, 1:1])
+    @variable(model, z[1:2*n_t, 1:k2_max] >= 0)
     x_dim = two_batt ? 2 * grid_size : grid_size
     @variable(model, x[1:x_dim])
     s_blocks[1] = @variable(model, [1:n_rows_s], Bin)
@@ -74,10 +80,19 @@ function build_z_master_milp(
             set_start_value(x[grid_size + t], soc0 * m_star * e_batt)
         end
     end
+    for t in 1:n_t
+        for k in 1:k2_max
+            set_start_value(z[2 * (t - 1) + 1, k], 0.0)
+            set_start_value(z[2 * (t - 1) + 2, k], 0.0)
+        end
+    end
     set_start_value(sigma, 0.0)
 
     # Constraint on uncertainty
     @constraint(model, P * w - p .<= 0)
+    for k in 1:k2_max
+        @constraint(model, H * z[:, k] .<= h)
+    end
     @constraint(model, [t in 1:grid_size], (x[t] - soc_min * n_star * e_batt) / energy_scale >= 0)
     @constraint(model, [t in 1:grid_size], (x[t] - soc_max * n_star * e_batt) / energy_scale <= 0)
     if two_batt

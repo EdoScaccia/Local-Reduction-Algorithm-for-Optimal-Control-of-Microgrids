@@ -13,6 +13,7 @@ include("find_initial_feasible_scenario_z_lambda.jl")
 include("build_max_z.jl")
 include("solve_local_red_z_lambda.jl")
 include("initialize_new_master_scenario.jl")
+include("add_master_scenario.jl")
 
 function _run_config_file_stem(soc0, horizon_days, grid_power_factor)
     soc0_pct = round(Int, 100 * soc0)
@@ -418,8 +419,7 @@ function run_local_reduction_nonlinear_existence(
     # Build the z maximization problem
     max_z_model = is_milp ?
         nothing :
-        build_max_z(ipopt_lin_solver, max_iter_ipopt, H, h, grid_size, battery_cost, pv_cost, base_pv_capacity_kw, e_batt, is_silent; two_batt=two_batt)
-
+        build_max_z(ipopt_lin_solver, max_iter_ipopt, H, h, grid_size, battery_cost, pv_cost, base_pv_capacity_kw, delta_t, e_batt, is_silent; two_batt=two_batt)
     # Find an initial feasible scenario z and lambda
     z_initial, lambda_initial = find_initial_feasible_scenario_z_lambda(H, h, grid_size, is_silent)
     if is_milp
@@ -514,6 +514,7 @@ function run_local_reduction_nonlinear_existence(
             println()
             break
         end
+        scenarios_added_this_iter = 0
 
         # Run the local reduction subroutine to find a violating scenario w (maximization step)
         sigma_star, w_star, x_witness, z_scenarios_used,  z_scenarios_history, lambda_scenarios_history = solve_local_red_z_lambda(
@@ -570,10 +571,15 @@ function run_local_reduction_nonlinear_existence(
                 sigma=sigma_star,
                 u_star=u_star,
                 master_x_solve_time=solve_elapsed,
-                scenarios_added_this_iter=0,
+                scenarios_added_this_iter=scenarios_added_this_iter,
                 cumulative_scenarios=scenarios_added,
                 z_scenarios_used=z_scenarios_used,
             ))
+            if scenarios_added_this_iter > 0
+                println("No constraint violation at MASTER level (sigma <= $tol_1); re-solving after added scenario.")
+                println()
+                continue
+            end
             println("No constraint violation at MASTER level (sigma <= $tol_1).")
             println()
             break
@@ -716,7 +722,6 @@ function run_local_reduction_nonlinear_existence(
                 end
             end
         end
-        # Epigraph constraint
         battery_count_var = n
         if two_batt
             battery_count_var += master_x[:m]
@@ -725,8 +730,10 @@ function run_local_reduction_nonlinear_existence(
             master_x,
             (battery_count_var * e_batt * battery_cost + s * base_pv_capacity_kw * pv_cost +
             sum(
-                w_star[6 * (t - 1) + 3] * z_blocks[scenario_slot][2 * (t - 1) + 1] -
-                w_star[6 * (t - 1) + 4] * z_blocks[scenario_slot][2 * (t - 1) + 2]
+                delta_t * (
+                    w_star[6 * (t - 1) + 3] * z_blocks[scenario_slot][2 * (t - 1) + 1] -
+                    w_star[6 * (t - 1) + 4] * z_blocks[scenario_slot][2 * (t - 1) + 2]
+                )
                 for t in 1:grid_size-1
             ) - gamma) / cost_scale <= 0
         )
@@ -775,7 +782,7 @@ function run_local_reduction_nonlinear_existence(
         )
 
         scenarios_added += 1
-        scenarios_added_this_iter = 1
+        scenarios_added_this_iter += 1
         w_scenarios_history[:, scenario_slot] = w_star
         println("Added scenario w", scenario_slot, " - MASTER")
 

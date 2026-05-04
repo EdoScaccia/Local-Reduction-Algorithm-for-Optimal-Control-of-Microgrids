@@ -16,6 +16,7 @@ function build_max_z_lp(
     battery_cost,
     pv_cost,
     base_pv_capacity_kw,
+    delta_t,
     e_batt,
     is_silent;
     two_batt::Bool=true,
@@ -23,7 +24,7 @@ function build_max_z_lp(
     """
     Build the lowest-level nonlinear maximization problem
 
-        max_{z, lambda, sigma_bar} sigma_bar
+        max_{lambda, sigma_bar} sigma_bar
 
     subject to
 
@@ -31,10 +32,8 @@ function build_max_z_lp(
 
     for all master-problem rows g_i built from:
     - logic rows at each time step
-    - power-balance equality split into two inequalities at each time step
-    - the epigraph row
 
-    with u_star, w_star, gamma_star, and sigma_star fixed from upper levels.
+    with u_star, w_star, z_star, gamma_star, and sigma_star fixed from upper levels.
     """
     n_t = grid_size - 1
     cost_scale = max(abs(base_pv_capacity_kw * pv_cost), abs(e_batt * battery_cost), 1.0)
@@ -50,10 +49,10 @@ function build_max_z_lp(
         set_silent(model)
     end
 
-    @variable(model, z[1: 2*n_t] >= 0)
     u_dim = two_batt ? 4 : 2
     l_dim_per_t = two_batt ? 3 : 2
     @variable(model, lambda[1:l_dim_per_t*n_t], Bin)
+    @variable(model, z[1:2*n_t] >= 0)
     @variable(model, u_star_var[1:u_dim*n_t])
     @variable(model, w_star_var[1: 6*n_t])
     @variable(model, sigma_bar)
@@ -64,14 +63,21 @@ function build_max_z_lp(
         @variable(model, m_star_var, Int)
     end
     @variable(model, s_star_var, Int)
-
     @constraint(model, H * vec(z) .<= h)
 
     # Constraints for each time step
     for t in 1:n_t
         u2_idx = u_dim * (t - 1)
+        w_idx = 6 * (t - 1)
         z_idx = 2 * (t - 1)
         l_idx = l_dim_per_t * (t - 1)
+        batt2_net_t = two_batt ? u_star_var[u2_idx + 4] - u_star_var[u2_idx + 3] : 0.0
+        @constraint(
+            model,
+            z[z_idx + 1] - z[z_idx + 2] +
+            u_star_var[u2_idx + 2] - u_star_var[u2_idx + 1] + batt2_net_t -
+            w_star_var[w_idx + 1] + s_star_var * w_star_var[w_idx + 2] == 0
+        )
 
 
         # Logic constraints
@@ -93,34 +99,20 @@ function build_max_z_lp(
         @constraint(model, sigma_bar <= sigma_star_var - (z[z_idx + 1] - pg_max * lambda[grid_l_idx]))
         @constraint(model, sigma_bar <= sigma_star_var - (-z[z_idx + 2]))
         @constraint(model, sigma_bar <= sigma_star_var - (z[z_idx + 2] - pg_max * (1 - lambda[grid_l_idx])))
-
-        idx = 6 * (t - 1)
-        PL_t = w_star_var[idx + 1]
-        PR_t = w_star_var[idx + 2]
-        batt2_net_t = two_batt ? u_star_var[u2_idx + 4] - u_star_var[u2_idx + 3] : 0.0
-        @constraint(
-            model, sigma_bar <= sigma_star_var -
-            (z[z_idx + 1] - z[z_idx + 2] + u_star_var[u2_idx + 2] - u_star_var[u2_idx + 1] + batt2_net_t - PL_t + s_star_var * PR_t))
-        @constraint(
-            model, sigma_bar <= sigma_star_var +
-            (z[z_idx + 1] - z[z_idx + 2] + u_star_var[u2_idx + 2] - u_star_var[u2_idx + 1] + batt2_net_t - PL_t + s_star_var * PR_t))
     end
 
-    battery_count_expr = n_star_var
-    if two_batt
-        battery_count_expr += m_star_var
-    end
-    epi_expr = (
+    investment_cost = (n_star_var + (two_batt ? m_star_var : 0.0)) * e_batt * battery_cost + s_star_var * base_pv_capacity_kw * pv_cost
+    epigraph_row = (
+        investment_cost +
         sum(
-            w_star_var[6 * (t - 1) + 3] * z[2 * (t - 1) + 1] -
-            w_star_var[6 * (t - 1) + 4] * z[2 * (t - 1) + 2]
+            delta_t * (
+                w_star_var[6 * (t - 1) + 3] * z[2 * (t - 1) + 1] -
+                w_star_var[6 * (t - 1) + 4] * z[2 * (t - 1) + 2]
+            )
             for t in 1:n_t
-        ) +
-        battery_count_expr * e_batt * battery_cost +
-        s_star_var * base_pv_capacity_kw * pv_cost -
-        gamma_star_var
+        ) - gamma_star_var
     ) / cost_scale
-    @constraint(model, sigma_bar <= sigma_star_var - epi_expr)
+    @constraint(model, sigma_bar <= sigma_star_var - epigraph_row)
 
     @objective(model, Max, sigma_bar)
 
@@ -140,9 +132,11 @@ function build_max_z_lp_fixed(
     battery_cost,
     pv_cost,
     base_pv_capacity_kw,
+    delta_t,
     e_batt,
     u_star,
     w_star,
+    z_star,
     gamma_star,
     sigma_star,
     n_star,
@@ -163,10 +157,10 @@ function build_max_z_lp_fixed(
     end
     is_silent && set_silent(model)
 
-    @variable(model, z[1:2*n_t] >= 0)
     u_dim = two_batt ? 4 : 2
     l_dim_per_t = two_batt ? 3 : 2
     @variable(model, lambda[1:l_dim_per_t*n_t], Bin)
+    @variable(model, z[1:2*n_t] >= 0)
     @variable(model, sigma_bar)
     @constraint(model, H * vec(z) .<= h)
 
@@ -175,6 +169,13 @@ function build_max_z_lp_fixed(
         z_idx = 2 * (t - 1)
         l_idx = l_dim_per_t * (t - 1)
         w_idx = 6 * (t - 1)
+        batt2_net_t = two_batt ? u_star[u_idx + 4] - u_star[u_idx + 3] : 0.0
+        @constraint(
+            model,
+            z[z_idx + 1] - z[z_idx + 2] +
+            u_star[u_idx + 2] - u_star[u_idx + 1] + batt2_net_t -
+            w_star[w_idx + 1] + s_star * w_star[w_idx + 2] == 0
+        )
 
         @constraint(model, sigma_bar <= sigma_star - (-u_star[u_idx + 1]))
         @constraint(model, sigma_bar <= sigma_star - (u_star[u_idx + 1] - n_max * pc_max * lambda[l_idx + 1]))
@@ -193,25 +194,21 @@ function build_max_z_lp_fixed(
         @constraint(model, sigma_bar <= sigma_star - (z[z_idx + 1] - pg_max * lambda[grid_l_idx]))
         @constraint(model, sigma_bar <= sigma_star - (-z[z_idx + 2]))
         @constraint(model, sigma_bar <= sigma_star - (z[z_idx + 2] - pg_max * (1 - lambda[grid_l_idx])))
-
-        batt2_net_t = two_batt ? u_star[u_idx + 4] - u_star[u_idx + 3] : 0.0
-        bal = z[z_idx + 1] - z[z_idx + 2] + u_star[u_idx + 2] - u_star[u_idx + 1] +
-              batt2_net_t - w_star[w_idx + 1] + s_star * w_star[w_idx + 2]
-        @constraint(model, sigma_bar <= sigma_star - bal)
-        @constraint(model, sigma_bar <= sigma_star + bal)
     end
 
-    epi_expr = (
+    investment_cost = (n_star + (two_batt ? m_star : 0.0)) * e_batt * battery_cost + s_star * base_pv_capacity_kw * pv_cost
+    epigraph_row = (
+        investment_cost +
         sum(
-            w_star[6 * (t - 1) + 3] * z[2 * (t - 1) + 1] -
-            w_star[6 * (t - 1) + 4] * z[2 * (t - 1) + 2]
+            delta_t * (
+                w_star[6 * (t - 1) + 3] * z[2 * (t - 1) + 1] -
+                w_star[6 * (t - 1) + 4] * z[2 * (t - 1) + 2]
+            )
             for t in 1:n_t
-        ) +
-        (n_star + (two_batt ? m_star : 0.0)) * e_batt * battery_cost +
-        s_star * base_pv_capacity_kw * pv_cost -
-        gamma_star
+        ) - gamma_star
     ) / cost_scale
-    @constraint(model, sigma_bar <= sigma_star - epi_expr)
+    @constraint(model, sigma_bar <= sigma_star - epigraph_row)
+
     @objective(model, Max, sigma_bar)
 
     return model
