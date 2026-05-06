@@ -9,7 +9,6 @@ function initialize_master_z!(
     u_star,
     soc0,
     n_star,
-    m_star,
     delta_t,
     e_batt;
     w_start=nothing,
@@ -17,11 +16,9 @@ function initialize_master_z!(
     z_witness=nothing,
     sigma_start=0.0,
     s_start_vectors=nothing,
-    two_batt::Bool=true,
 )
     n_rows_w = size(P, 2)
-    u_dim = two_batt ? 4 : 2
-    x_dim_factor = two_batt ? 2 : 1
+    u_dim = 2
     n_t = div(length(u_star), u_dim)
     w_ub = p[1:n_rows_w]
     w_lb = -p[n_rows_w + 1:2 * n_rows_w]
@@ -50,23 +47,17 @@ function initialize_master_z!(
     end
 
     grid_size = n_t + 1
-    x_init = zeros(x_dim_factor * grid_size)
+    x_init = zeros(grid_size)
     if x_witness !== nothing && length(x_witness) == length(x_init)
         x_init .= x_witness
     else
         x_init[1] = soc0 * n_star * e_batt
-        if two_batt
-            x_init[grid_size + 1] = soc0 * m_star * e_batt
-        end
         for t in 1:n_t
             u_idx = u_dim * (t - 1)
             w_idx = 6 * (t - 1)
             eta_ch_t = w_init[w_idx + 5]
             rho_dis_t = w_init[w_idx + 6]
             x_init[t + 1] = x_init[t] + (eta_ch_t * u_star[u_idx + 1] - rho_dis_t * u_star[u_idx + 2]) * delta_t
-            if two_batt
-                x_init[grid_size + t + 1] = x_init[grid_size + t] + (eta_ch_t * u_star[u_idx + 3] - rho_dis_t * u_star[u_idx + 4]) * delta_t
-            end
         end
     end
 

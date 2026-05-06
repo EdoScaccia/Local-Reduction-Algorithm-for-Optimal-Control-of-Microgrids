@@ -372,7 +372,6 @@ function load_problem_data(
     pv_error_pct::Float64=0.10,
     pv_factor::Float64=1.0,
     grid_power_factor::Float64=1.0,
-    battery_factor::Float64=1.0,
     battery_cost::Float64=200.0,
 )
     if horizon_days < 1
@@ -438,9 +437,6 @@ function load_problem_data(
         "n_t" => n_t,
     )
 
-    microgrid_params["Pc_MAX"] *= battery_factor
-    microgrid_params["Pd_MAX"] *= battery_factor
-    microgrid_params["E_BATT"] *= battery_factor
     microgrid_params["battery_cost"] = battery_cost
     microgrid_params["grid_size"] = n_t + 1
     microgrid_params["T"] = n_t * microgrid_params["Δt"]

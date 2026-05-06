@@ -1,7 +1,7 @@
 using Dates
 using PyPlot
 
-include("run_local_reduction_nonlinear_existence.jl")
+include("run_local_red.jl")
 
 function _unpack_flat_w_scenario(w_flat)
     n_t = div(length(w_flat), 6)
@@ -97,7 +97,7 @@ function _last_finite_scenario(w_scenarios_history)
     return w_scenarios_history[:, end]
 end
 
-function _reconstruct_soc_trajectories(u_star, w_scenarios_history, microgrid_params, n_star, m_star)
+function _reconstruct_soc_trajectories(u_star, w_scenarios_history, microgrid_params, n_star)
     n_t = div(size(w_scenarios_history, 1), 6)
     u_dim = div(length(u_star), n_t)
     two_batt = u_dim == 4
@@ -110,7 +110,7 @@ function _reconstruct_soc_trajectories(u_star, w_scenarios_history, microgrid_pa
     delta_t = microgrid_params["Δt"]
     e_batt = microgrid_params["E_BATT"]
     capacity1 = n_star * e_batt
-    capacity2 = two_batt ? m_star * e_batt : 1.0
+    capacity2 = 1.0
 
     energy1[1] = microgrid_params["SoC0"] * capacity1
     energy2[1] = two_batt ? microgrid_params["SoC0"] * capacity2 : NaN
@@ -154,7 +154,7 @@ end
 
 function _plot_soc_and_control(res, microgrid_params)
     u_star = res.u_star
-    soc1, soc2 = _reconstruct_soc_trajectories(u_star, res.w_scenarios_history, microgrid_params, res.n_star, res.m_star)
+    soc1, soc2 = _reconstruct_soc_trajectories(u_star, res.w_scenarios_history, microgrid_params, res.n_star)
     PG_plus, PG_minus = _reconstruct_grid_flow_trajectory(u_star, res.w_scenarios_history, res.s_star)
     pg_plus_max = microgrid_params["PG_plus_MAX"]
 
@@ -204,23 +204,21 @@ end
 run_kwargs = (
     is_silent=true,
     ipopt_lin_solver="mumps",
-    milp_optimizer="Gurobi",
+    mip_optimizer="Gurobi",
     max_iter_ipopt=10000,
     save_results=true,
-    is_milp=true,
-    two_batt=false,
+    is_mip=false,
     is_cycle=false,
     warm_start_from_1day=false,
     n_max=100,
-    m_max=100,
     s_max=100,
     horizon_days=1,
     grid_power_factor=0.4,
     soc0=0.6,
-    k1_max=10,
+    k1_max=100,
     k2_max=20,
 )
 
-res = run_local_reduction_nonlinear_existence(; run_kwargs...)
+res = run_local_red(; run_kwargs...)
 _plot_all_w_scenarios(res, res.uncertainty_bounds, res.microgrid_params)
 _plot_soc_and_control(res, res.microgrid_params)

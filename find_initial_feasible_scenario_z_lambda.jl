@@ -19,14 +19,13 @@ function find_initial_feasible_scenario_z_lambda(H,
     end
 
     @variable(model, z[1:2, 1:n_t] >= 0)
-    @variable(model, lambda[1:6, 1:n_t] >= 0)
+    @variable(model, lambda[1:4, 1:n_t] >= 0)
 
     @constraint(model, H * vec(z) .<= h)
     for t in 1:n_t
         # Simplex constraints on lambda
         @constraint(model, lambda[1, t] + lambda[2, t] == 1)
         @constraint(model, lambda[3, t] + lambda[4, t] == 1)
-        @constraint(model, lambda[5, t] + lambda[6, t] == 1)
     end
     @objective(model, Min, 0)
     optimize!(model)

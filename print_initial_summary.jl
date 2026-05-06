@@ -5,7 +5,6 @@ function print_initial_summary(
     n_w,
     k1_max,
     k2_max,
-    k3_max,
     tol_1,
     tol_2,
     processed_data_path,
@@ -16,7 +15,6 @@ function print_initial_summary(
     pv_error_pct,
     pv_factor,
     grid_power_factor,
-    battery_factor,
     battery_cost,
     pv_cost,
     base_pv_capacity_kw
@@ -37,7 +35,6 @@ function print_initial_summary(
     println("pv_error_pct = ", pv_error_pct)
     println("pv_factor = ", pv_factor)
     println("grid_power_factor = ", grid_power_factor)
-    println("battery_factor = ", battery_factor)
     println("battery_cost = ", battery_cost)
     println("pv_cost = ", pv_cost)
     println("base_pv_capacity_kw = ", base_pv_capacity_kw)
@@ -45,7 +42,6 @@ function print_initial_summary(
     println("Algorithm parameters:")
     println("k1_max = ", k1_max)
     println("k2_max = ", k2_max)
-    println("k3_max = ", k3_max)
     println("tol_1 = ", tol_1)
     println("tol_2 = ", tol_2)
     println(repeat("=", 52))

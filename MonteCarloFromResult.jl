@@ -4,12 +4,19 @@ using PyPlot
 
 include("load_problem_data.jl")
 
-result_path = joinpath(@__DIR__, "Results", "MILP_SOC060_H1_PG60_B1_2026-05-04_115723.jld2")
+result_path = "Revision/Results/MIP_SOC060_H1_PG40_2026-05-06_173205.jld2"
 
 # Leave as `nothing` to use the last finite saved solution.
 # Set to an integer, e.g. `selected_solution_idx = 3`, to replay a specific
 # column of `u_star_history` and `master_x_obj_history`.
-selected_solution_idx = 2
+selected_solution_idx = nothing
+
+function _latest_result_path(results_dir)
+    isdir(results_dir) || return nothing
+    candidates = filter(path -> endswith(path, ".jld2"), readdir(results_dir; join=true))
+    isempty(candidates) && return nothing
+    return first(sort(candidates; by=mtime, rev=true))
+end
 
 function _last_finite_col(matrix)
     for j in size(matrix, 2):-1:1
@@ -132,55 +139,39 @@ function _param_value(result_data, microgrid_params, key; aliases=String[], defa
     return Float64(default)
 end
 
-function _unpack_u_star(u_star, grid_size; two_batt=nothing)
+function _unpack_u_star(u_star, grid_size)
     n_t = grid_size - 1
     u_dim = div(length(u_star), n_t)
     length(u_star) == u_dim * n_t || error("u_star length $(length(u_star)) is not compatible with grid_size=$grid_size.")
 
-    if two_batt === nothing
-        two_batt = u_dim == 4
-    end
-    expected_u_dim = two_batt ? 4 : 2
-    u_dim == expected_u_dim || error("Expected u_dim=$expected_u_dim, found u_dim=$u_dim.")
+    u_dim == 2 || error("Expected one-battery u_dim=2, found u_dim=$u_dim.")
 
     Pc1 = [u_star[u_dim * (t - 1) + 1] for t in 1:n_t]
     Pd1 = [u_star[u_dim * (t - 1) + 2] for t in 1:n_t]
-    Pc2 = two_batt ? [u_star[u_dim * (t - 1) + 3] for t in 1:n_t] : zeros(n_t)
-    Pd2 = two_batt ? [u_star[u_dim * (t - 1) + 4] for t in 1:n_t] : zeros(n_t)
 
-    return Pc1, Pd1, Pc2, Pd2
+    return Pc1, Pd1
 end
 
-function _propagate_soc(Pc1_mat, Pd1_mat, Pc2_mat, Pd2_mat, eta_ch, rho_dis, microgrid_params, n_star, m_star; two_batt=false)
+function _propagate_soc(Pc1_mat, Pd1_mat, eta_ch, rho_dis, microgrid_params, n_star)
     n_t, n_scenarios = size(Pc1_mat)
     energy1 = Matrix{Float64}(undef, n_t + 1, n_scenarios)
-    energy2 = Matrix{Float64}(undef, n_t + 1, n_scenarios)
     soc1 = Matrix{Float64}(undef, n_t + 1, n_scenarios)
-    soc2 = Matrix{Float64}(undef, n_t + 1, n_scenarios)
 
     soc0 = microgrid_params["SoC0"]
     delta_t = microgrid_params["Δt"]
     e_batt = microgrid_params["E_BATT"]
     capacity1 = n_star * e_batt
-    capacity2 = two_batt ? m_star * e_batt : NaN
     capacity1 > 0 || error("n_star gives non-positive capacity: n_star=$n_star.")
-    !two_batt || capacity2 > 0 || error("m_star gives non-positive capacity: m_star=$m_star.")
 
     energy1[1, :] .= soc0 * capacity1
-    energy2[1, :] .= two_batt ? soc0 * capacity2 : NaN
     soc1[1, :] .= soc0
-    soc2[1, :] .= two_batt ? soc0 : NaN
 
     for t in 1:n_t
         energy1[t + 1, :] .= energy1[t, :] .+ (eta_ch[t, :] .* Pc1_mat[t, :] .- rho_dis[t, :] .* Pd1_mat[t, :]) .* delta_t
         soc1[t + 1, :] .= energy1[t + 1, :] ./ capacity1
-        if two_batt
-            energy2[t + 1, :] .= energy2[t, :] .+ (eta_ch[t, :] .* Pc2_mat[t, :] .- rho_dis[t, :] .* Pd2_mat[t, :]) .* delta_t
-            soc2[t + 1, :] .= energy2[t + 1, :] ./ capacity2
-        end
     end
 
-    return soc1, soc2, energy1, energy2
+    return soc1, energy1
 end
 
 function _scenario_max(values)
@@ -326,8 +317,9 @@ function _plot_worst_scenario_trajectory(summary; case_key="worst_physical_case"
     uncertainty_bounds = summary["uncertainty_bounds"]
 
     n_t = length(case["PL"])
-    t_u = collect(0:n_t-1) .* microgrid_params["Δt"]
-    t_x = collect(0:n_t) .* microgrid_params["Δt"]
+    delta_t = microgrid_params["Δt"]
+    t_u = collect(0:n_t-1) .* delta_t
+    t_x = collect(0:n_t) .* delta_t
     soc_min = microgrid_params["SOC_MIN"]
     soc_max = microgrid_params["SOC_MAX"]
     soc0 = microgrid_params["SoC0"]
@@ -338,24 +330,18 @@ function _plot_worst_scenario_trajectory(summary; case_key="worst_physical_case"
     investment_cost = summary["investment_cost"]
     gamma_star = summary["gamma_star"]
 
-    operating_cost_cumsum = cumsum(case["C_buy"] .* case["PG_plus"] .- case["C_sell"] .* case["PG_minus"])
+    operating_cost_cumsum = cumsum(delta_t .* (case["C_buy"] .* case["PG_plus"] .- case["C_sell"] .* case["PG_minus"]))
     epigraph_cumsum = investment_cost .+ operating_cost_cumsum
 
     fig, axs = plt.subplots(6, 1, figsize=(12, 14), sharex=false, constrained_layout=true)
     fig.suptitle("Monte Carlo worst scenario: " * replace(case_key, "_" => " "), fontsize=14)
 
     axs[1].plot(t_x, case["soc1"], color="black", linewidth=2, label="SoC pack 1")
-    if summary["two_batt"]
-        axs[1].plot(t_x, case["soc2"], color="tab:purple", linewidth=2, label="SoC pack 2")
-    end
     axs[1].axhline(soc_min, color="red", linestyle="--", linewidth=1.5, label="SoC min/max")
     axs[1].axhline(soc_max, color="red", linestyle="--", linewidth=1.5)
     if is_cycle
         axs[1].axhline(soc0, color="tab:green", linestyle=":", linewidth=1.5, label="terminal target")
         axs[1].scatter([t_x[end]], [case["soc1"][end]], color="black", s=25)
-        if summary["two_batt"]
-            axs[1].scatter([t_x[end]], [case["soc2"][end]], color="tab:purple", s=25)
-        end
     end
     axs[1].set_ylabel("SoC")
     axs[1].grid(true, alpha=0.3)
@@ -413,7 +399,7 @@ function _plot_worst_scenario_trajectory(summary; case_key="worst_physical_case"
     return fig, axs
 end
 
-function _worst_case_dict(idx, PL, PR, C_buy, C_sell, eta_ch, rho_dis, soc1, soc2, PG_plus, PG_minus, required_grid_net, epigraph_values, epigraph_violations, soc_bound_violations, terminal_soc_violations, load_balance_violations, is_corner_scenario, corner_labels)
+function _worst_case_dict(idx, PL, PR, C_buy, C_sell, eta_ch, rho_dis, soc1, PG_plus, PG_minus, required_grid_net, epigraph_values, epigraph_violations, soc_bound_violations, terminal_soc_violations, load_balance_violations, is_corner_scenario, corner_labels)
     return Dict(
         "PL" => PL[:, idx],
         "PR" => PR[:, idx],
@@ -422,7 +408,6 @@ function _worst_case_dict(idx, PL, PR, C_buy, C_sell, eta_ch, rho_dis, soc1, soc
         "eta_ch" => eta_ch[:, idx],
         "rho_dis" => rho_dis[:, idx],
         "soc1" => soc1[:, idx],
-        "soc2" => soc2[:, idx],
         "PG_plus" => PG_plus[:, idx],
         "PG_minus" => PG_minus[:, idx],
         "required_grid_net" => required_grid_net[:, idx],
@@ -454,20 +439,23 @@ function run_monte_carlo_from_result(result_path::AbstractString; n_scenarios::I
 
     u_star, gamma_star, selected_solution_idx = _extract_solution_from_result(result_data; solution_idx=solution_idx)
     solve_stats = haskey(result_data, "solve_stats") ? result_data["solve_stats"] : nothing
-    formulation = haskey(result_data, "is_milp") && Bool(result_data["is_milp"]) ? "MILP" : "NLP"
-    optimizer_solve_count = Int(_stats_value(solve_stats, :nlp_count; default=0)) + Int(_stats_value(solve_stats, :lp_count; default=0))
+    formulation_is_mip = haskey(result_data, "is_mip") ? Bool(result_data["is_mip"]) :
+                         (haskey(result_data, "is_milp") ? Bool(result_data["is_milp"]) : false)
+    formulation = formulation_is_mip ? "MIP" : "NLP"
+    optimizer_solve_count =
+        Int(_stats_value(solve_stats, :nlp_count; default=0)) +
+        Int(_stats_value(solve_stats, :mip_count; default=0)) +
+        Int(_stats_value(solve_stats, :lp_count; default=0))
     local_reduction_runtime_seconds = Float64(_result_field(result_data, "total_elapsed_seconds"; default=_stats_value(solve_stats, :local_red_time; default=NaN)))
     n_star = _result_value(result_data, "n_star")
-    m_star = _result_value(result_data, "m_star"; default=0.0)
     s_star = _result_value(result_data, "s_star")
     isfinite(n_star) || error("Result file does not contain finite `n_star`.")
     isfinite(s_star) || error("Result file does not contain finite `s_star`.")
 
     grid_size = microgrid_params["grid_size"]
     n_t = grid_size - 1
-    two_batt = haskey(result_data, "two_batt") ? Bool(result_data["two_batt"]) : div(length(u_star), n_t) == 4
     is_cycle = haskey(result_data, "is_cycle") ? Bool(result_data["is_cycle"]) : false
-    Pc1, Pd1, Pc2, Pd2 = _unpack_u_star(u_star, grid_size; two_batt=two_batt)
+    Pc1, Pd1 = _unpack_u_star(u_star, grid_size)
 
     random_scenarios = _sample_uniform_scenarios(uncertainty_bounds, n_scenarios, grid_size)
     corner_scenarios = _global_corner_scenarios(uncertainty_bounds, grid_size)
@@ -483,10 +471,8 @@ function run_monte_carlo_from_result(result_path::AbstractString; n_scenarios::I
 
     Pc1_mat = repeat(reshape(Pc1, n_t, 1), 1, total_scenarios)
     Pd1_mat = repeat(reshape(Pd1, n_t, 1), 1, total_scenarios)
-    Pc2_mat = repeat(reshape(Pc2, n_t, 1), 1, total_scenarios)
-    Pd2_mat = repeat(reshape(Pd2, n_t, 1), 1, total_scenarios)
 
-    required_grid_net = Pc1_mat .+ Pc2_mat .+ PL .- s_star .* PR .- Pd1_mat .- Pd2_mat
+    required_grid_net = Pc1_mat .+ PL .- s_star .* PR .- Pd1_mat
     PG_plus = max.(required_grid_net, 0.0)
     PG_minus = max.(-required_grid_net, 0.0)
     pg_plus_max = microgrid_params["PG_plus_MAX"]
@@ -497,24 +483,20 @@ function run_monte_carlo_from_result(result_path::AbstractString; n_scenarios::I
     load_balance_violation_by_scenario = _scenario_max(load_balance_violation_t)
     load_balance_violated = load_balance_violation_by_scenario .> 1e-7
 
-    soc1, soc2, energy1, energy2 = _propagate_soc(Pc1_mat, Pd1_mat, Pc2_mat, Pd2_mat, eta_ch, rho_dis, microgrid_params, n_star, m_star; two_batt=two_batt)
+    soc1, energy1 = _propagate_soc(Pc1_mat, Pd1_mat, eta_ch, rho_dis, microgrid_params, n_star)
     soc_min = microgrid_params["SOC_MIN"]
     soc_max = microgrid_params["SOC_MAX"]
     soc1_bound_violation_t = max.(soc_min .- soc1, soc1 .- soc_max, 0.0)
-    soc2_bound_violation_t = two_batt ? max.(soc_min .- soc2, soc2 .- soc_max, 0.0) : zeros(size(soc1))
-    soc_bound_violation_by_scenario = _scenario_max(max.(soc1_bound_violation_t, soc2_bound_violation_t))
+    soc_bound_violation_by_scenario = _scenario_max(soc1_bound_violation_t)
     soc_bound_violated = soc_bound_violation_by_scenario .> 1e-7
     soc_bound_violation_counts = _scenario_count(soc1_bound_violation_t .> 1e-7)
-    soc_bound_violation_counts .+= two_batt ? _scenario_count(soc2_bound_violation_t .> 1e-7) : zeros(total_scenarios)
-    soc_bound_constraint_count = (two_batt ? 2 : 1) * (n_t + 1)
+    soc_bound_constraint_count = n_t + 1
 
     soc0 = microgrid_params["SoC0"]
     terminal_soc1_violation = abs.(soc1[end, :] .- soc0)
-    terminal_soc2_violation = two_batt ? abs.(soc2[end, :] .- soc0) : zeros(total_scenarios)
-    terminal_soc_violation_by_scenario = is_cycle ? max.(terminal_soc1_violation, terminal_soc2_violation) : zeros(total_scenarios)
+    terminal_soc_violation_by_scenario = is_cycle ? terminal_soc1_violation : zeros(total_scenarios)
     terminal_soc_violated = terminal_soc_violation_by_scenario .> 1e-7
     terminal_soc_violation_counts = is_cycle ? Float64.(terminal_soc1_violation .> 1e-7) : zeros(total_scenarios)
-    terminal_soc_violation_counts .+= (is_cycle && two_batt) ? Float64.(terminal_soc2_violation .> 1e-7) : zeros(total_scenarios)
 
     delta_t = microgrid_params["Δt"]
     operating_costs = vec(sum(delta_t .* (C_buy .* PG_plus .- C_sell .* PG_minus); dims=1))
@@ -522,7 +504,7 @@ function run_monte_carlo_from_result(result_path::AbstractString; n_scenarios::I
     battery_cost = _param_value(result_data, microgrid_params, "battery_cost"; aliases=["Battery_Cost"], default=200.0)
     pv_cost = _param_value(result_data, microgrid_params, "pv_cost"; aliases=["PV_Cost"], default=1500.0)
     base_pv_capacity_kw = _param_value(result_data, microgrid_params, "base_pv_capacity_kw"; aliases=["Base_PV_Capacity_kW"], default=90.84)
-    investment_cost = (n_star + (two_batt ? m_star : 0.0)) * e_batt * battery_cost + s_star * base_pv_capacity_kw * pv_cost
+    investment_cost = n_star * e_batt * battery_cost + s_star * base_pv_capacity_kw * pv_cost
     epigraph_values = investment_cost .+ operating_costs
     epigraph_violations = epigraph_values .- gamma_star
     epigraph_violated = epigraph_violations .> 1e-7
@@ -572,10 +554,8 @@ function run_monte_carlo_from_result(result_path::AbstractString; n_scenarios::I
         "formulation" => formulation,
         "local_reduction_runtime_seconds" => local_reduction_runtime_seconds,
         "optimizer_solve_count" => optimizer_solve_count,
-        "two_batt" => two_batt,
         "is_cycle" => is_cycle,
         "n_star" => n_star,
-        "m_star" => m_star,
         "s_star" => s_star,
         "gamma_star" => gamma_star,
         "microgrid_params" => microgrid_params,
@@ -631,16 +611,14 @@ function run_monte_carlo_from_result(result_path::AbstractString; n_scenarios::I
         "infeasible_indices" => infeasible_indices,
         "infeasible_corner_indices" => infeasible_corner_indices,
         "infeasible_random_indices" => infeasible_random_indices,
-        "worst_physical_case" => _worst_case_dict(worst_physical_idx, PL, PR, C_buy, C_sell, eta_ch, rho_dis, soc1, soc2, PG_plus, PG_minus, required_grid_net, epigraph_values, epigraph_violations, soc_bound_violation_by_scenario, terminal_soc_violation_by_scenario, load_balance_violation_by_scenario, is_corner_scenario, corner_labels),
-        "worst_epigraph_case" => _worst_case_dict(worst_epigraph_idx, PL, PR, C_buy, C_sell, eta_ch, rho_dis, soc1, soc2, PG_plus, PG_minus, required_grid_net, epigraph_values, epigraph_violations, soc_bound_violation_by_scenario, terminal_soc_violation_by_scenario, load_balance_violation_by_scenario, is_corner_scenario, corner_labels),
-        "worst_soc_bound_case" => _worst_case_dict(worst_soc_idx, PL, PR, C_buy, C_sell, eta_ch, rho_dis, soc1, soc2, PG_plus, PG_minus, required_grid_net, epigraph_values, epigraph_violations, soc_bound_violation_by_scenario, terminal_soc_violation_by_scenario, load_balance_violation_by_scenario, is_corner_scenario, corner_labels),
-        "worst_terminal_soc_case" => _worst_case_dict(worst_terminal_idx, PL, PR, C_buy, C_sell, eta_ch, rho_dis, soc1, soc2, PG_plus, PG_minus, required_grid_net, epigraph_values, epigraph_violations, soc_bound_violation_by_scenario, terminal_soc_violation_by_scenario, load_balance_violation_by_scenario, is_corner_scenario, corner_labels),
-        "worst_load_balance_case" => _worst_case_dict(worst_balance_idx, PL, PR, C_buy, C_sell, eta_ch, rho_dis, soc1, soc2, PG_plus, PG_minus, required_grid_net, epigraph_values, epigraph_violations, soc_bound_violation_by_scenario, terminal_soc_violation_by_scenario, load_balance_violation_by_scenario, is_corner_scenario, corner_labels),
+        "worst_physical_case" => _worst_case_dict(worst_physical_idx, PL, PR, C_buy, C_sell, eta_ch, rho_dis, soc1, PG_plus, PG_minus, required_grid_net, epigraph_values, epigraph_violations, soc_bound_violation_by_scenario, terminal_soc_violation_by_scenario, load_balance_violation_by_scenario, is_corner_scenario, corner_labels),
+        "worst_epigraph_case" => _worst_case_dict(worst_epigraph_idx, PL, PR, C_buy, C_sell, eta_ch, rho_dis, soc1, PG_plus, PG_minus, required_grid_net, epigraph_values, epigraph_violations, soc_bound_violation_by_scenario, terminal_soc_violation_by_scenario, load_balance_violation_by_scenario, is_corner_scenario, corner_labels),
+        "worst_soc_bound_case" => _worst_case_dict(worst_soc_idx, PL, PR, C_buy, C_sell, eta_ch, rho_dis, soc1, PG_plus, PG_minus, required_grid_net, epigraph_values, epigraph_violations, soc_bound_violation_by_scenario, terminal_soc_violation_by_scenario, load_balance_violation_by_scenario, is_corner_scenario, corner_labels),
+        "worst_terminal_soc_case" => _worst_case_dict(worst_terminal_idx, PL, PR, C_buy, C_sell, eta_ch, rho_dis, soc1, PG_plus, PG_minus, required_grid_net, epigraph_values, epigraph_violations, soc_bound_violation_by_scenario, terminal_soc_violation_by_scenario, load_balance_violation_by_scenario, is_corner_scenario, corner_labels),
+        "worst_load_balance_case" => _worst_case_dict(worst_balance_idx, PL, PR, C_buy, C_sell, eta_ch, rho_dis, soc1, PG_plus, PG_minus, required_grid_net, epigraph_values, epigraph_violations, soc_bound_violation_by_scenario, terminal_soc_violation_by_scenario, load_balance_violation_by_scenario, is_corner_scenario, corner_labels),
         "u_star" => u_star,
         "soc1" => soc1,
-        "soc2" => soc2,
         "energy1" => energy1,
-        "energy2" => energy2,
         "PG_plus" => PG_plus,
         "PG_minus" => PG_minus,
         "required_grid_net" => required_grid_net,
@@ -652,7 +630,7 @@ function run_monte_carlo_from_result(result_path::AbstractString; n_scenarios::I
     println(repeat("-", 88))
     println(rpad("Result file", 30), " | ", result_path)
     println(rpad("Scenarios", 30), " | ", total_scenarios, " (", n_scenarios, " random + ", corner_scenarios["n_corners"], " corners)")
-    println(rpad("n_star, m_star, s_star", 30), " | ", n_star, ", ", m_star, ", ", s_star)
+    println(rpad("n_star, s_star", 30), " | ", n_star, ", ", s_star)
     println(rpad("Constraint count", 30), " | ", total_constraint_count, " per scenario")
     if !isempty(infeasible_corner_indices)
         println(rpad("Infeasible corner scenarios", 30), " | ", [corner_labels[idx] for idx in infeasible_corner_indices])
@@ -663,10 +641,11 @@ function run_monte_carlo_from_result(result_path::AbstractString; n_scenarios::I
     return summary
 end
 
-if isfile(result_path)
-    mc = run_monte_carlo_from_result(result_path; solution_idx=selected_solution_idx)
+resolved_result_path = result_path === nothing ? _latest_result_path(joinpath(@__DIR__, "Results")) : result_path
+if resolved_result_path !== nothing && isfile(resolved_result_path)
+    mc = run_monte_carlo_from_result(resolved_result_path; solution_idx=selected_solution_idx)
     grid_condition = _check_fixed_dispatch_grid_condition(mc)
     fig_worst, axs_worst = _plot_worst_scenario_trajectory(mc)
 else
-    @warn "Set `result_path` in MonteCarloFromResult.jl to one saved .jld2 file before running."
+    @warn "No saved .jld2 result found. Set `result_path` in MonteCarloFromResult.jl or run `run_local_red` with save_results=true."
 end
