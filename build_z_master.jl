@@ -52,7 +52,7 @@ function build_z_master(
     else
         n_logic_rows = 2
     end
-    n_rows_s = n_logic_rows * n_t + 1
+    n_rows_s = n_logic_rows * n_t + 2 * grid_size + 1
     w_ub = p[1:n_rows_w]
     w_lb = -p[n_rows_w + 1:2 * n_rows_w]
     w_mid = 0.5 .* (w_lb .+ w_ub)

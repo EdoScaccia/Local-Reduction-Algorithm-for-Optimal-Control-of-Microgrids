@@ -18,13 +18,17 @@ function build_max_z(
     pc_max,
     pd_max,
     pg_max,
-    n_max
+    n_max,
+    soc0,
+    soc_min,
+    soc_max,
 )
     """
     Build the lowest-level nonlinear maximization problem.
     """
     n_t = grid_size - 1
     cost_scale = max(abs(base_pv_capacity_kw * pv_cost), abs(e_batt * battery_cost), 1.0)
+    energy_scale = max(abs(e_batt * n_max), 1.0)
     if is_mip
         if mip_optimizer == "Gurobi"
             model = Model(Gurobi.Optimizer)
@@ -67,7 +71,11 @@ function build_max_z(
     @variable(model, sigma_bar)
     @variable(model, sigma_star_var)
     @variable(model, gamma_star_var)
+    @variable(model, x[1:grid_size])
     @constraint(model, H * vec(z) .<= h)
+    @constraint(model, (x[1] - soc0 * n_star_var * e_batt) / energy_scale == 0)
+    @constraint(model, sigma_bar <= sigma_star_var - ((soc_min * n_star_var * e_batt - x[1]) / energy_scale))
+    @constraint(model, sigma_bar <= sigma_star_var - ((x[1] - soc_max * n_star_var * e_batt) / energy_scale))
 
     # Constraints for each time step
     for t in 1:n_t
@@ -81,6 +89,15 @@ function build_max_z(
             u_star_var[u2_idx + 2] - u_star_var[u2_idx + 1] -
             w_star_var[w_idx + 1] + s_star_var * w_star_var[w_idx + 2] == 0
         )
+        @constraint(
+            model,
+            (x[t + 1] - x[t] - (
+                w_star_var[w_idx + 5] * u_star_var[u2_idx + 1] -
+                w_star_var[w_idx + 6] * u_star_var[u2_idx + 2]
+            ) * delta_t) / energy_scale == 0
+        )
+        @constraint(model, sigma_bar <= sigma_star_var - ((soc_min * n_star_var * e_batt - x[t + 1]) / energy_scale))
+        @constraint(model, sigma_bar <= sigma_star_var - ((x[t + 1] - soc_max * n_star_var * e_batt) / energy_scale))
 
         # Logic constraints
         if is_mip

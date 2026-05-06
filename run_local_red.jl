@@ -371,7 +371,10 @@ function run_local_red(
                     pc_max,
                     pd_max,
                     pg_max,
-                    n_max
+                    n_max,
+                    soc0,
+                    soc_min,
+                    soc_max,
                 )
     
     
