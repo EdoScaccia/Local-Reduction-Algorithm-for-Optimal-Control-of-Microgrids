@@ -14,6 +14,8 @@ include("build_max_z.jl")
 include("solve_local_red_z_lambda.jl")
 include("initialize_new_master_scenario.jl")
 include("add_master_scenario.jl")
+include("build_grid_feasibility_oracle.jl")
+include("build_grid_feasibility_selector_oracle.jl")
 
 function _run_config_file_stem(soc0, horizon_days, grid_power_factor)
     soc0_pct = round(Int, 100 * soc0)
@@ -207,6 +209,7 @@ function run_local_reduction_nonlinear_existence(
     warm_start_1day_file=nothing,
     two_batt::Bool=true,
     is_cycle::Bool=false,
+    use_grid_selector_oracle::Bool=false,
     n_max::Real=100,
     m_max::Real=100,
     s_max::Real=100,
@@ -378,6 +381,7 @@ function run_local_reduction_nonlinear_existence(
     u = master_x[:u]
     gamma = master_x[:gamma]
     n = master_x[:n]
+    soc0_var = master_x[:SOC0]
     s = master_x[:s]
 
     if warm_start_from_1day && horizon_days > 1
@@ -420,6 +424,16 @@ function run_local_reduction_nonlinear_existence(
     max_z_model = is_milp ?
         nothing :
         build_max_z(ipopt_lin_solver, max_iter_ipopt, H, h, grid_size, battery_cost, pv_cost, base_pv_capacity_kw, delta_t, e_batt, is_silent; two_batt=two_batt)
+    grid_oracle_models = use_grid_selector_oracle ? nothing :
+        build_grid_feasibility_oracle_models(
+            P,
+            p,
+            grid_size,
+            u_dim,
+            milp_optimizer=milp_optimizer,
+            is_silent=is_silent,
+            two_batt=two_batt,
+        )
     # Find an initial feasible scenario z and lambda
     z_initial, lambda_initial = find_initial_feasible_scenario_z_lambda(H, h, grid_size, is_silent)
     if is_milp
@@ -516,6 +530,120 @@ function run_local_reduction_nonlinear_existence(
         end
         scenarios_added_this_iter = 0
 
+        if use_grid_selector_oracle
+            grid_sigma_star, w_grid_star, grid_solve_elapsed, grid_ts, grid_ps, _ = solve_grid_feasibility_selector_oracle(
+                P,
+                p,
+                grid_size,
+                u_star,
+                s_star,
+                pg_max,
+                milp_optimizer=milp_optimizer,
+                is_silent=is_silent,
+                two_batt=two_batt,
+            )
+            grid_sigmas = [grid_sigma_star]
+            w_grid_candidates = reshape(w_grid_star, :, 1)
+            grid_n_solves = 1
+        else
+            grid_sigmas, w_grid_candidates, grid_solve_elapsed, grid_ts, grid_ps, grid_n_solves = solve_grid_feasibility_oracle!(
+                grid_oracle_models,
+                u_star,
+                s_star,
+                pg_max,
+                two_batt,
+            )
+        end
+        solve_stats[:lp_count] += grid_n_solves
+        solve_stats[:lp_time] += grid_solve_elapsed
+        if use_grid_selector_oracle
+            println("Grid feasibility selector oracle | sigma* = ", grid_sigmas[1])
+        else
+            println("Grid feasibility oracle | sigma+* = ", grid_sigmas[1], " | sigma-* = ", grid_sigmas[2])
+        end
+        println("Grid feasibility oracle solves = ", grid_n_solves)
+        println("Grid feasibility oracle solve time: ", round(grid_solve_elapsed; digits=3), " s")
+        if !(grid_ts in (JuMP.MOI.OPTIMAL, JuMP.MOI.ALMOST_OPTIMAL))
+            println("Grid feasibility oracle status: ", grid_ts, " | primal status: ", grid_ps)
+        end
+        println()
+
+        stop_after_grid_oracle = false
+        for grid_side in eachindex(grid_sigmas)
+            if grid_sigmas[grid_side] <= tol_1
+                continue
+            end
+            if scenario_slot + 1 > k1_slots
+                println("Reached maximum number of scenario slots before adding grid-feasibility scenario. Stopping.")
+                println()
+                stop_after_grid_oracle = true
+                break
+            end
+            w_grid_star = w_grid_candidates[:, grid_side]
+            scenario_slot += 1
+            add_master_scenario!(
+                master_x,
+                x_blocks,
+                z_blocks,
+                l_blocks,
+                scenario_slot,
+                w_grid_star,
+                nothing,
+                x_block_starts,
+                z_block_starts,
+                l_block_starts,
+                u,
+                gamma,
+                n,
+                s,
+                u_star,
+                gamma_star,
+                n_star,
+                m_star,
+                s_star,
+                grid_size,
+                x_dim_factor,
+                u_dim,
+                is_milp,
+                two_batt,
+                is_cycle,
+                H,
+                h,
+                soc0,
+                soc_min,
+                soc_max,
+                pc_max,
+                pd_max,
+                pg_max,
+                n_max,
+                m_max,
+                battery_cost,
+                pv_cost,
+                base_pv_capacity_kw,
+                delta_t,
+                e_batt,
+                energy_scale,
+                cost_scale,
+            )
+            push!(x_block_starts, [something(start_value(v), 0.0) for v in x_blocks[scenario_slot]])
+            push!(z_block_starts, [something(start_value(v), 0.0) for v in z_blocks[scenario_slot]])
+            push!(l_block_starts, [something(start_value(v), 0.0) for v in l_blocks[scenario_slot]])
+            scenarios_added += 1
+            scenarios_added_this_iter += 1
+            w_scenarios_history[:, scenario_slot] = w_grid_star
+            grid_label = use_grid_selector_oracle ? "GRID_SELECTOR" : (grid_side == 1 ? "GRID+" : "GRID-")
+            println("Added scenario w", scenario_slot, " - ", grid_label)
+            println()
+
+            if scenario_slot + 1 > k1_slots
+                println("Reached maximum number of scenario slots after grid-feasibility scenario. Stopping.")
+                println()
+                stop_after_grid_oracle = true
+                break
+            end
+        end
+        stop_after_grid_oracle && break
+
         # Run the local reduction subroutine to find a violating scenario w (maximization step)
         sigma_star, w_star, x_witness, z_scenarios_used,  z_scenarios_history, lambda_scenarios_history = solve_local_red_z_lambda(
                 max_z_model,
@@ -559,7 +687,6 @@ function run_local_reduction_nonlinear_existence(
                 solve_stats=solve_stats,
                 is_milp=is_milp,
                 milp_optimizer=milp_optimizer,
-                two_batt=two_batt,
                 is_cycle=is_cycle,
         )
 
@@ -624,7 +751,8 @@ function run_local_reduction_nonlinear_existence(
 
         # Initial conditions
         if is_milp
-            @constraint(master_x, x_blocks[scenario_slot][1] == soc0 * n_var * e_batt)
+            # @constraint(master_x, x_blocks[scenario_slot][1] == soc0 * n_var * e_batt)
+            @constraint(master_x, x_blocks[scenario_slot][1] == soc0_var * n_var * e_batt)
         else
             @constraint(master_x, (x_blocks[scenario_slot][1] - soc0 * n_var * e_batt) / energy_scale == 0)
         end
@@ -829,6 +957,7 @@ function run_local_reduction_nonlinear_existence(
             battery_factor=battery_factor,
             two_batt=two_batt,
             is_cycle=is_cycle,
+            use_grid_selector_oracle=use_grid_selector_oracle,
             n_max=n_max,
             m_max=m_max,
             s_max=s_max,
@@ -884,6 +1013,7 @@ function run_local_reduction_nonlinear_existence(
             battery_factor=battery_factor,
             two_batt=two_batt,
             is_cycle=is_cycle,
+            use_grid_selector_oracle=use_grid_selector_oracle,
             n_max=n_max,
             m_max=m_max,
             s_max=s_max,
