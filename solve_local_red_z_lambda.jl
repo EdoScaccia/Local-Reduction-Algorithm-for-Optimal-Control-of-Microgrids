@@ -15,6 +15,7 @@ function _z_master_g_row_values(
     soc0,
     soc_min,
     soc_max,
+    pg_max,
     battery_cost,
     pv_cost,
     base_pv_capacity_kw,
@@ -43,6 +44,19 @@ function _z_master_g_row_values(
     for t in 1:grid_size
         push!(g_values, (soc_min * n_star * e_batt - x_values[t]) / energy_scale)
         push!(g_values, (x_values[t] - soc_max * n_star * e_batt) / energy_scale)
+    end
+
+    for t in 1:n_t
+        w_idx = 6 * (t - 1)
+        u_idx = u_dim * (t - 1)
+        required_grid_net = (
+            w_scenario[w_idx + 1] -
+            s_star * w_scenario[w_idx + 2] -
+            u_star[u_idx + 2] +
+            u_star[u_idx + 1]
+        )
+        push!(g_values, required_grid_net - pg_max)
+        push!(g_values, -required_grid_net - pg_max)
     end
 
     for t in 1:n_t
@@ -204,6 +218,43 @@ function _build_master_z_selector_rows!(
     end
 
     for t in 1:n_t
+        w_idx = 6 * (t - 1)
+        u_idx = u_dim * (t - 1)
+        required_grid_net = (
+            w[w_idx + 1, 1] -
+            s_star * w[w_idx + 2, 1] -
+            u_star[u_idx + 2] +
+            u_star[u_idx + 1]
+        )
+        grid_plus_residual = required_grid_net - pg_max
+        grid_minus_residual = -required_grid_net - pg_max
+
+        if is_mip
+            d_lb = w_lb[w_idx + 1] - s_star * w_ub[w_idx + 2] - u_star[u_idx + 2] + u_star[u_idx + 1]
+            d_ub = w_ub[w_idx + 1] - s_star * w_lb[w_idx + 2] - u_star[u_idx + 2] + u_star[u_idx + 1]
+            _push_milp_row!(
+                g_rows,
+                g_lbs,
+                g_ubs,
+                grid_plus_residual,
+                d_lb - pg_max,
+                d_ub - pg_max,
+            )
+            _push_milp_row!(
+                g_rows,
+                g_lbs,
+                g_ubs,
+                grid_minus_residual,
+                -d_ub - pg_max,
+                -d_lb - pg_max,
+            )
+        else
+            push!(g_rows, grid_plus_residual)
+            push!(g_rows, grid_minus_residual)
+        end
+    end
+
+    for t in 1:n_t
         u_idx = u_dim * (t - 1)
         z_idx = 2 * (t - 1)
 
@@ -357,7 +408,7 @@ function solve_local_red_z_lambda(
     w = master_z[:w]
     sigma = master_z[:sigma]
     n_t = grid_size - 1
-    n_rows_s = (is_mip ? milp_logic_rows_per_t : nlp_logic_rows_per_t) * n_t + 2 * grid_size + 1
+    n_rows_s = (is_mip ? milp_logic_rows_per_t : nlp_logic_rows_per_t) * n_t + 2 * grid_size + 2 * n_t + 1
     cost_scale = max(abs(base_pv_capacity_kw * pv_cost), abs(e_batt * battery_cost), 1.0)
     n_w = size(P, 2)
     w_ub = p[1:n_w]
@@ -418,6 +469,7 @@ function solve_local_red_z_lambda(
                 soc0,
                 soc_min,
                 soc_max,
+                pg_max,
                 battery_cost,
                 pv_cost,
                 base_pv_capacity_kw,
@@ -564,6 +616,7 @@ function solve_local_red_z_lambda(
                         soc0,
                         soc_min,
                         soc_max,
+                        pg_max,
                         battery_cost,
                         pv_cost,
                         base_pv_capacity_kw,

@@ -378,21 +378,21 @@ function run_local_red(
                 )
     
     
-    max_grid_model = build_grid_feasibility_selector_oracle(
-                            is_mip,
-                            mip_optimizer,
-                            ipopt_lin_solver, 
-                            max_iter_ipopt,
-                            P,
-                            p,
-                            grid_size,
-                            pg_max,
-                            pc_max=pc_max,
-                            pd_max=pd_max,
-                            n_max=n_max,
-                            s_max=s_max,
-                            is_silent=is_silent,
-                        )
+    # max_grid_model = build_grid_feasibility_selector_oracle(
+    #                         is_mip,
+    #                         mip_optimizer,
+    #                         ipopt_lin_solver, 
+    #                         max_iter_ipopt,
+    #                         P,
+    #                         p,
+    #                         grid_size,
+    #                         pg_max,
+    #                         pc_max=pc_max,
+    #                         pd_max=pd_max,
+    #                         n_max=n_max,
+    #                         s_max=s_max,
+    #                         is_silent=is_silent,
+    #                     )
 
     
 
@@ -482,97 +482,97 @@ function run_local_red(
         end
         scenarios_added_this_iter = 0
 
-        # Maximize grid constraints
-        print("Maximizing grid constraints... ")
-        flush(stdout)
-        fix.(max_grid_model[:u_star_var], u_star, force = true)
-        fix(max_grid_model[:s_star_var], s_star, force = true)
-        solve_t0 = time()
-        optimize!(max_grid_model)
-        solve_elapsed = time() - solve_t0
-        if is_mip
-            solve_stats[:mip_count] += 1
-            solve_stats[:mip_time] += solve_elapsed 
-        else
-            solve_stats[:nlp_count] += 1
-            solve_stats[:nlp_time] += solve_elapsed
-        end
-        println("Done.")
+        # # Maximize grid constraints
+        # print("Maximizing grid constraints... ")
+        # flush(stdout)
+        # fix.(max_grid_model[:u_star_var], u_star, force = true)
+        # fix(max_grid_model[:s_star_var], s_star, force = true)
+        # solve_t0 = time()
+        # optimize!(max_grid_model)
+        # solve_elapsed = time() - solve_t0
+        # if is_mip
+        #     solve_stats[:mip_count] += 1
+        #     solve_stats[:mip_time] += solve_elapsed 
+        # else
+        #     solve_stats[:nlp_count] += 1
+        #     solve_stats[:nlp_time] += solve_elapsed
+        # end
+        # println("Done.")
 
-        # Check master solution status
-        ts = termination_status(max_grid_model)
-        ps = primal_status(max_grid_model)
-        if ts != JuMP.MOI.OPTIMAL && ts != JuMP.MOI.LOCALLY_SOLVED && ts != JuMP.MOI.ALMOST_OPTIMAL && ts != JuMP.MOI.ALMOST_LOCALLY_SOLVED
-            println("MASTER did not return OPTIMAL.")
-            println("Termination status: ", ts)
-            println("Primal status: ", ps)
-            println("Stopping local reduction.")
-            break
-        end
+        # # Check master solution status
+        # ts = termination_status(max_grid_model)
+        # ps = primal_status(max_grid_model)
+        # if ts != JuMP.MOI.OPTIMAL && ts != JuMP.MOI.LOCALLY_SOLVED && ts != JuMP.MOI.ALMOST_OPTIMAL && ts != JuMP.MOI.ALMOST_LOCALLY_SOLVED
+        #     println("MASTER did not return OPTIMAL.")
+        #     println("Termination status: ", ts)
+        #     println("Primal status: ", ps)
+        #     println("Stopping local reduction.")
+        #     break
+        # end
 
-        w_grid_star = vec(value.(max_grid_model[:w]))
-        grid_sigma_star = value(max_grid_model[:sigma])
-        println("Grid feasibility selector oracle | sigma* = ", grid_sigma_star)
-        println()
+        # w_grid_star = vec(value.(max_grid_model[:w]))
+        # grid_sigma_star = value(max_grid_model[:sigma])
+        # println("Grid feasibility selector oracle | sigma* = ", grid_sigma_star)
+        # println()
 
-        if grid_sigma_star <= tol_1
-            println("No violated grid constraint found.")
-            println()
-        elseif scenario_slot + 1 > k1_slots
-            println("Reached maximum number of scenario slots before adding grid-feasibility scenario. Stopping.")
-            println()
-            break
-        else
-            scenario_slot += 1
-            starts = add_master_scenario!(
-                master_x,
-                x_blocks,
-                z_blocks,
-                l_blocks,
-                scenario_slot,
-                w_grid_star,
-                nothing,
-                x_block_starts,
-                z_block_starts,
-                l_block_starts,
-                u,
-                gamma,
-                n,
-                s,
-                u_star,
-                gamma_star,
-                n_star,
-                s_star,
-                grid_size,
-                u_dim,
-                is_mip,
-                is_cycle,
-                H,
-                h,
-                soc0,
-                soc_min,
-                soc_max,
-                pc_max,
-                pd_max,
-                pg_max,
-                n_max,
-                battery_cost,
-                pv_cost,
-                base_pv_capacity_kw,
-                delta_t,
-                e_batt,
-                energy_scale,
-                cost_scale,
-            )
-            push!(x_block_starts, starts.x_start)
-            push!(z_block_starts, starts.z_start)
-            push!(l_block_starts, starts.l_start)
-            scenarios_added += 1
-            scenarios_added_this_iter += 1
-            w_scenarios_history[:, scenario_slot] = w_grid_star
-            println("Added scenario w", scenario_slot, " - GRID")
-            println()
-        end
+        # if grid_sigma_star <= tol_1
+        #     println("No violated grid constraint found.")
+        #     println()
+        # elseif scenario_slot + 1 > k1_slots
+        #     println("Reached maximum number of scenario slots before adding grid-feasibility scenario. Stopping.")
+        #     println()
+        #     break
+        # else
+        #     scenario_slot += 1
+        #     starts = add_master_scenario!(
+        #         master_x,
+        #         x_blocks,
+        #         z_blocks,
+        #         l_blocks,
+        #         scenario_slot,
+        #         w_grid_star,
+        #         nothing,
+        #         x_block_starts,
+        #         z_block_starts,
+        #         l_block_starts,
+        #         u,
+        #         gamma,
+        #         n,
+        #         s,
+        #         u_star,
+        #         gamma_star,
+        #         n_star,
+        #         s_star,
+        #         grid_size,
+        #         u_dim,
+        #         is_mip,
+        #         is_cycle,
+        #         H,
+        #         h,
+        #         soc0,
+        #         soc_min,
+        #         soc_max,
+        #         pc_max,
+        #         pd_max,
+        #         pg_max,
+        #         n_max,
+        #         battery_cost,
+        #         pv_cost,
+        #         base_pv_capacity_kw,
+        #         delta_t,
+        #         e_batt,
+        #         energy_scale,
+        #         cost_scale,
+        #     )
+        #     push!(x_block_starts, starts.x_start)
+        #     push!(z_block_starts, starts.z_start)
+        #     push!(l_block_starts, starts.l_start)
+        #     scenarios_added += 1
+        #     scenarios_added_this_iter += 1
+        #     w_scenarios_history[:, scenario_slot] = w_grid_star
+        #     println("Added scenario w", scenario_slot, " - GRID")
+        #     println()
+        # end
 
         # Run the local reduction subroutine to find a violating scenario w (maximization step)
         sigma_star, w_star, x_witness, z_scenarios_used,  z_scenarios_history, lambda_scenarios_history = solve_local_red_z_lambda(

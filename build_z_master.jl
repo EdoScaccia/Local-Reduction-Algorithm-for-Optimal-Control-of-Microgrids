@@ -52,7 +52,8 @@ function build_z_master(
     else
         n_logic_rows = 2
     end
-    n_rows_s = n_logic_rows * n_t + 2 * grid_size + 1
+    n_grid_rows = 2 * n_t
+    n_rows_s = n_logic_rows * n_t + 2 * grid_size + n_grid_rows + 1
     w_ub = p[1:n_rows_w]
     w_lb = -p[n_rows_w + 1:2 * n_rows_w]
     w_mid = 0.5 .* (w_lb .+ w_ub)
@@ -111,8 +112,8 @@ function build_z_master(
     for k in 1:k2_max
         @constraint(model, H * z[:, k] .<= h)
     end
-    @constraint(model, [t in 1:grid_size], (x[t] - soc_min * n_star * e_batt) / energy_scale >= 0)
-    @constraint(model, [t in 1:grid_size], (x[t] - soc_max * n_star * e_batt) / energy_scale <= 0)
+    # @constraint(model, [t in 1:grid_size], (x[t] - soc_min * n_star * e_batt) / energy_scale >= 0)
+    # @constraint(model, [t in 1:grid_size], (x[t] - soc_max * n_star * e_batt) / energy_scale <= 0)
     @constraint(model, (x[1] - soc0 * n_star * e_batt) / energy_scale == 0)
     if is_cycle
         @constraint(model, (x[grid_size] - soc0 * n_star * e_batt) / energy_scale == 0)

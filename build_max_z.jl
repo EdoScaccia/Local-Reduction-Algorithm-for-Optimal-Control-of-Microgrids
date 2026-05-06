@@ -83,12 +83,12 @@ function build_max_z(
         w_idx = 6 * (t - 1)
         z_idx = 2 * (t - 1)
         l_idx = l_dim_per_t * (t - 1)
-        @constraint(
-            model,
-            z[z_idx + 1] - z[z_idx + 2] +
-            u_star_var[u2_idx + 2] - u_star_var[u2_idx + 1] -
-            w_star_var[w_idx + 1] + s_star_var * w_star_var[w_idx + 2] == 0
-        )
+        # @constraint(
+        #     model,
+        #     z[z_idx + 1] - z[z_idx + 2] +
+        #     u_star_var[u2_idx + 2] - u_star_var[u2_idx + 1] -
+        #     w_star_var[w_idx + 1] + s_star_var * w_star_var[w_idx + 2] == 0
+        # )
         @constraint(
             model,
             (x[t + 1] - x[t] - (
@@ -98,6 +98,15 @@ function build_max_z(
         )
         @constraint(model, sigma_bar <= sigma_star_var - ((soc_min * n_star_var * e_batt - x[t + 1]) / energy_scale))
         @constraint(model, sigma_bar <= sigma_star_var - ((x[t + 1] - soc_max * n_star_var * e_batt) / energy_scale))
+
+        required_grid_net = (
+            w_star_var[w_idx + 1] -
+            s_star_var * w_star_var[w_idx + 2] -
+            u_star_var[u2_idx + 2] +
+            u_star_var[u2_idx + 1]
+        )
+        @constraint(model, sigma_bar <= sigma_star_var - (required_grid_net - pg_max))
+        @constraint(model, sigma_bar <= sigma_star_var - (-required_grid_net - pg_max))
 
         # Logic constraints
         if is_mip
