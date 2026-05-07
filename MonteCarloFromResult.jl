@@ -4,7 +4,7 @@ using PyPlot
 
 include("load_problem_data.jl")
 
-result_path = "Revision/Results/MIP_SOC060_H5_PG40_2026-05-06_185440.jld2"
+result_path = "Revision/Results/NLP_SOC060_H1_PG40_2026-05-07_165201.jld2"
 
 # Leave as `nothing` to use the last finite saved solution.
 # Set to an integer, e.g. `selected_solution_idx = 3`, to replay a specific

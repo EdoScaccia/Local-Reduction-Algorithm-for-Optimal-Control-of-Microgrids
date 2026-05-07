@@ -207,17 +207,17 @@ run_kwargs = (
     mip_optimizer="Gurobi",
     max_iter_ipopt=10000,
     save_results=true,
-    is_mip=true,
+    is_mip=false,
     is_cycle=false,
     warm_start_from_1day=false,
     n_max=100,
     s_max=100,
     horizon_days=1,
-    grid_power_factor=0.2,
-    soc0=0.2,
-    k1_max=100,
-    k2_max=20,
-    z_master_restarts=1,
+    grid_power_factor=1.0,
+    soc0=1.0,
+    k1_max=10,
+    k2_max=10,
+    z_master_restarts=5,
 )
 
 res = run_local_red(; run_kwargs...)

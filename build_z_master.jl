@@ -47,13 +47,7 @@ function build_z_master(
     n_rows_w = size(P, 2)
     n_t = grid_size - 1
     u_dim = 2
-    if is_mip
-        n_logic_rows = 8
-    else
-        n_logic_rows = 2
-    end
-    n_grid_rows = 2 * n_t
-    n_rows_s = n_logic_rows * n_t + 2 * grid_size + n_grid_rows + 1
+    n_rows_s = master_z_selector_row_count(is_mip, grid_size)
     w_ub = p[1:n_rows_w]
     w_lb = -p[n_rows_w + 1:2 * n_rows_w]
     w_mid = 0.5 .* (w_lb .+ w_ub)
