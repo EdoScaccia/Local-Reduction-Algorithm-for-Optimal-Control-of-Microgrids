@@ -43,7 +43,11 @@ function _save_local_reduction_results(
     mkpath(results_dir)
     timestamp = Dates.format(now(), "yyyy-mm-dd_HHMMSS")
     config_stem = _run_config_file_stem(soc0, horizon_days, grid_power_factor)
-    formulation_stem = is_mip ? "MIP" : "NLP"
+    if is_mip
+        formulation_stem = "MIP"
+    else
+        formulation_stem = "NLP"
+    end
     stem = formulation_stem * "_" * config_stem
     results_path = joinpath(results_dir, stem * "_" * timestamp * ".jld2")
     JLD2.jldsave(
