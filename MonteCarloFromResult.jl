@@ -5,7 +5,7 @@ using Statistics
 include("load_problem_data.jl")
 
 # User inputs.
-formulation_input = "NLP"  # "NLP" or "MIP"
+formulation_input = "MIP"  # "NLP" or "MIP"
 n_monte_carlo_scenarios = 100_000
 selected_solution_idx = nothing
 monte_carlo_seed = 1234
@@ -388,6 +388,7 @@ function _aggregate_mc_summaries(formulation, summaries, failures, missing, n_sc
         "n_missing_result_files" => length(missing),
         "average_runtime_seconds" => _safe_mean(runtimes),
         "max_runtime_seconds" => _safe_max(runtimes),
+        "average_gamma_star" => _safe_mean([s["gamma_star"] for s in summaries]),
         "average_feasible_scenarios_pct" => _safe_mean([s["feasible_scenarios_pct"] for s in summaries]),
         "average_infeasible_scenarios_pct" => _safe_mean([s["infeasible_scenarios_pct"] for s in summaries]),
         "average_constraint_violated_to_total_problem_constraints_pct" => _safe_mean([s["constraint_violated_to_total_pct"] for s in summaries]),
@@ -415,6 +416,7 @@ function _print_aggregate_mc_summary(summary)
         ("Scenarios per result", summary["n_requested_scenarios_per_result"]),
         ("Average runtime (s)", _fmt(summary["average_runtime_seconds"])),
         ("Max runtime (s)", _fmt(summary["max_runtime_seconds"])),
+        ("Average gamma*", _fmt(summary["average_gamma_star"])),
         ("Average feasible scenarios (%)", _fmt(summary["average_feasible_scenarios_pct"])),
         ("Average infeasible scenarios (%)", _fmt(summary["average_infeasible_scenarios_pct"])),
         ("Average constraint violated / total constraints (%)", _fmt(summary["average_constraint_violated_to_total_problem_constraints_pct"])),
