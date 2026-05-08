@@ -57,6 +57,41 @@ function _microgrid_value(microgrid_params, key, aliases...)
     error("Could not find microgrid parameter `$key`.")
 end
 
+function _param_value(result_data, microgrid_params, key; aliases=String[], default=nothing)
+    if haskey(result_data, key)
+        return Float64(result_data[key])
+    end
+    if haskey(microgrid_params, key)
+        return Float64(microgrid_params[key])
+    end
+    if haskey(result_data, "data_config")
+        data_config = result_data["data_config"]
+        key_sym = Symbol(key)
+        if hasproperty(data_config, key_sym)
+            return Float64(getproperty(data_config, key_sym))
+        end
+    end
+
+    for alias in aliases
+        if haskey(result_data, alias)
+            return Float64(result_data[alias])
+        end
+        if haskey(microgrid_params, alias)
+            return Float64(microgrid_params[alias])
+        end
+        if haskey(result_data, "data_config")
+            data_config = result_data["data_config"]
+            alias_sym = Symbol(alias)
+            if hasproperty(data_config, alias_sym)
+                return Float64(getproperty(data_config, alias_sym))
+            end
+        end
+    end
+
+    default === nothing && error("Could not find parameter `$key`.")
+    return Float64(default)
+end
+
 function _load_bounds_and_params(result_data)
     if haskey(result_data, "uncertainty_bounds") && haskey(result_data, "microgrid_params")
         return result_data["uncertainty_bounds"], result_data["microgrid_params"], get(result_data, "resolved_data_path", "")
@@ -223,6 +258,12 @@ function run_monte_carlo_from_result(
     soc_max = _microgrid_value(microgrid_params, "SOC_MAX")
     pg_plus_max = _microgrid_value(microgrid_params, "PG_plus_MAX")
     pg_minus_max = _microgrid_value(microgrid_params, "PG_minus_MAX")
+    delta_t = _microgrid_value(microgrid_params, "Δt", "Î”t")
+    e_batt = _microgrid_value(microgrid_params, "E_BATT")
+    battery_cost = _param_value(result_data, microgrid_params, "battery_cost"; aliases=["Battery_Cost"], default=200.0)
+    pv_cost = _param_value(result_data, microgrid_params, "pv_cost"; aliases=["PV_Cost"], default=1500.0)
+    base_pv_capacity_kw = _param_value(result_data, microgrid_params, "base_pv_capacity_kw"; aliases=["Base_PV_Capacity_kW"], default=90.84)
+    investment_cost = n_star * e_batt * battery_cost + s_star * base_pv_capacity_kw * pv_cost
 
     Pc_pos = max.(Pc, 0.0)
     Pd_pos = max.(Pd, 0.0)
@@ -235,13 +276,15 @@ function run_monte_carlo_from_result(
     soc_constraint_count = 2 * grid_size
     grid_constraint_count = 2 * n_t
     logic_constraint_count = 2 * n_t
-    total_constraint_count = soc_constraint_count + grid_constraint_count + logic_constraint_count
+    cost_constraint_count = 1
+    total_constraint_count = soc_constraint_count + grid_constraint_count + logic_constraint_count + cost_constraint_count
 
     n_infeasible = 0
     violated_count_sum = 0.0
     soc_count_sum = 0.0
     grid_count_sum = 0.0
     logic_count_sum = 0.0
+    cost_count_sum = 0.0
     max_violation_sum = 0.0
     max_violation_seen = 0.0
 
@@ -253,6 +296,8 @@ function run_monte_carlo_from_result(
 
         PL = samples["PL"]
         PR = samples["PR"]
+        C_buy = samples["C_buy"]
+        C_sell = samples["C_sell"]
         eta_ch = samples["eta_ch"]
         rho_dis = samples["rho_dis"]
 
@@ -275,14 +320,23 @@ function run_monte_carlo_from_result(
 
         logic_counts = fill(Float64(logic_count_per_scenario), n_chunk)
         logic_max_by_scenario = fill(logic_max, n_chunk)
-        violated_counts = soc_counts .+ grid_counts .+ logic_counts
-        max_violation_by_scenario = max.(soc_max_by_scenario, grid_max_by_scenario, logic_max_by_scenario)
 
-        n_infeasible += count(violated_counts .> 0)
+        PG_plus = max.(required_grid_net, 0.0)
+        PG_minus = max.(-required_grid_net, 0.0)
+        operating_cost = vec(sum(delta_t .* (C_buy .* PG_plus .- C_sell .* PG_minus); dims=1))
+        cost_violation_by_scenario = max.(investment_cost .+ operating_cost .- gamma_star, 0.0)
+        cost_counts = Float64.(cost_violation_by_scenario .> violation_tol)
+
+        violated_counts = soc_counts .+ grid_counts .+ logic_counts .+ cost_counts
+        max_violation_by_scenario = max.(soc_max_by_scenario, grid_max_by_scenario, logic_max_by_scenario, cost_violation_by_scenario)
+
+        feasibility_counts = soc_counts .+ grid_counts .+ logic_counts
+        n_infeasible += count(feasibility_counts .> 0)
         violated_count_sum += sum(violated_counts)
         soc_count_sum += sum(soc_counts)
         grid_count_sum += sum(grid_counts)
         logic_count_sum += sum(logic_counts)
+        cost_count_sum += sum(cost_counts)
         max_violation_sum += sum(max_violation_by_scenario)
         max_violation_seen = max(max_violation_seen, maximum(max_violation_by_scenario))
 
@@ -293,7 +347,7 @@ function run_monte_carlo_from_result(
         end
     end
 
-    total_violated = soc_count_sum + grid_count_sum + logic_count_sum
+    total_violated = soc_count_sum + grid_count_sum + logic_count_sum + cost_count_sum
 
     runtime = Float64(_result_field(result_data, "total_elapsed_seconds"; default=NaN))
 
@@ -312,12 +366,14 @@ function run_monte_carlo_from_result(
         "soc_bounds_share_of_violated_pct" => total_violated == 0 ? 0.0 : 100.0 * soc_count_sum / total_violated,
         "logic_share_of_violated_pct" => total_violated == 0 ? 0.0 : 100.0 * logic_count_sum / total_violated,
         "grid_cap_share_of_violated_pct" => total_violated == 0 ? 0.0 : 100.0 * grid_count_sum / total_violated,
+        "cost_share_of_violated_pct" => total_violated == 0 ? 0.0 : 100.0 * cost_count_sum / total_violated,
         "average_max_constraint_violation" => max_violation_sum / n_scenarios,
         "max_constraint_violation" => max_violation_seen,
         "total_constraint_count" => total_constraint_count,
         "soc_constraint_count" => soc_constraint_count,
         "logic_constraint_count" => logic_constraint_count,
         "grid_constraint_count" => grid_constraint_count,
+        "cost_constraint_count" => cost_constraint_count,
         "n_infeasible" => n_infeasible,
     )
 end
@@ -338,6 +394,7 @@ function _aggregate_mc_summaries(formulation, summaries, failures, missing, n_sc
         "among_violated_average_soc_bounds_pct" => _safe_mean([s["soc_bounds_share_of_violated_pct"] for s in summaries]),
         "among_violated_average_logic_constraints_pct" => _safe_mean([s["logic_share_of_violated_pct"] for s in summaries]),
         "among_violated_average_grid_cap_constraints_pct" => _safe_mean([s["grid_cap_share_of_violated_pct"] for s in summaries]),
+        "among_violated_average_cost_constraints_pct" => _safe_mean([s["cost_share_of_violated_pct"] for s in summaries]),
         "average_maximum_constraint_violation" => _safe_mean([s["max_constraint_violation"] for s in summaries]),
         "average_scenario_max_constraint_violation" => _safe_mean([s["average_max_constraint_violation"] for s in summaries]),
         "per_result_summaries" => summaries,
@@ -364,6 +421,7 @@ function _print_aggregate_mc_summary(summary)
         ("Among violated: average SoC bounds (%)", _fmt(summary["among_violated_average_soc_bounds_pct"])),
         ("Among violated: average logic constraints (%)", _fmt(summary["among_violated_average_logic_constraints_pct"])),
         ("Among violated: average grid cap constraints (%)", _fmt(summary["among_violated_average_grid_cap_constraints_pct"])),
+        ("Among violated: average cost constraints (%)", _fmt(summary["among_violated_average_cost_constraints_pct"])),
         ("Average maximum constraint violation", _fmt(summary["average_maximum_constraint_violation"])),
     ]
 
