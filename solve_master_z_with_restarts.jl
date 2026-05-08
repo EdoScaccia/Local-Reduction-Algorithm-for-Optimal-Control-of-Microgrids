@@ -20,7 +20,31 @@ function randomize_master_z_lambda_starts!(s_blocks, rng, z_scenarios_used)
     return nothing
 end
 
-function solve_master_z_with_restarts!(master_z, s_blocks, z_scenarios_used, n_restarts, rng_seed, is_silent; solve_stats=nothing, solve_label="NLP")
+function _master_z_solution_ok(model)
+    ts = termination_status(model)
+    ps = primal_status(model)
+    return (ts in (
+            JuMP.MOI.OPTIMAL,
+            JuMP.MOI.LOCALLY_SOLVED,
+            JuMP.MOI.ALMOST_OPTIMAL,
+            JuMP.MOI.ALMOST_LOCALLY_SOLVED,
+        )) && (ps in (
+            JuMP.MOI.FEASIBLE_POINT,
+            JuMP.MOI.NEARLY_FEASIBLE_POINT,
+        ))
+end
+
+function solve_master_z_with_restarts!(
+    master_z,
+    s_blocks,
+    z_scenarios_used,
+    n_restarts,
+    rng_seed,
+    is_silent;
+    solve_stats=nothing,
+    solve_label="NLP",
+    recovery_restarts::Int=20,
+)
     """
     Solve the master Z problem with multiple random restarts to try to find a better local optimum.
     The lambda vector is initilaized randomly for each restart, and the best solution across all restarts is returned.
@@ -42,39 +66,48 @@ function solve_master_z_with_restarts!(master_z, s_blocks, z_scenarios_used, n_r
     restart_text = n_restarts == 1 ? "1 solve" : "$n_restarts random restarts"
     print("    ", "Solving $solve_label for $restart_text...")
     flush(stdout)
-    for restart_id in 1:n_restarts
+    max_attempts = n_restarts + recovery_restarts
+    done_printed = false
+    for restart_id in 1:max_attempts
+        if restart_id == n_restarts + 1
+            print(" no feasible point; extending with $recovery_restarts recovery restarts...")
+            flush(stdout)
+        end
         if restart_id > 1
             randomize_master_z_lambda_starts!(s_blocks, rng, z_scenarios_used)
         end
         # Solve the master z problem
         solve_t0 = time()
-        optimize!(master_z)
+        solve_error = nothing
+        try
+            optimize!(master_z)
+        catch err
+            solve_error = err
+        end
         solve_elapsed = time() - solve_t0
         if solve_stats !== nothing
-            solve_stats[:nlp_count] += 1
-            solve_stats[:nlp_time] += solve_elapsed
+            if solve_label == "MIP"
+                solve_stats[:mip_count] += 1
+                solve_stats[:mip_time] += solve_elapsed
+            else
+                solve_stats[:nlp_count] += 1
+                solve_stats[:nlp_time] += solve_elapsed
+            end
         end
-        if restart_id < n_restarts
+        if restart_id < max_attempts
             print("$restart_id,")
         else
             println("$restart_id, Done.")
+            done_printed = true
         end
 
-        # Check the termination status
-        ts = termination_status(master_z)
-        ps = primal_status(master_z)
-        ok = (ts in (
-                JuMP.MOI.OPTIMAL,
-                JuMP.MOI.LOCALLY_SOLVED,
-                JuMP.MOI.ALMOST_OPTIMAL,
-                JuMP.MOI.ALMOST_LOCALLY_SOLVED,
-            )) && (ps in (
-                JuMP.MOI.FEASIBLE_POINT,
-                JuMP.MOI.NEARLY_FEASIBLE_POINT,
-            ))
+        if solve_error !== nothing
+            println("    Master Z restart $restart_id threw an error: ", sprint(showerror, solve_error))
+            continue
+        end
 
         # If the NLP solver returned a valid solution, check if it's the best one we've found across all restarts
-        if ok
+        if _master_z_solution_ok(master_z)
             obj = objective_value(master_z)
             if obj > best_obj
                 best_obj = obj
@@ -85,6 +118,14 @@ function solve_master_z_with_restarts!(master_z, s_blocks, z_scenarios_used, n_r
                 best_sigma = value(master_z[:sigma])
                 best_found = true
             end
+        end
+
+        if restart_id >= n_restarts && best_found
+            if !done_printed
+                println(" Done.")
+                done_printed = true
+            end
+            break
         end
     end
 

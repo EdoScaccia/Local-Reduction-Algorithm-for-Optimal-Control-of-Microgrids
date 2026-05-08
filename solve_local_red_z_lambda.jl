@@ -127,6 +127,7 @@ function solve_local_red_z_lambda(
     is_silent=true,
     z_master_restarts::Int=1,
     z_master_restart_seed::Int=1234,
+    z_master_recovery_restarts::Int=20,
     show_z_iter::Bool=false,
     show_w_vec::Bool=false,
     solve_stats=nothing,
@@ -284,6 +285,7 @@ function solve_local_red_z_lambda(
             is_silent,
             solve_stats=solve_stats,
             solve_label=is_mip ? "MIP" : "NLP",
+            recovery_restarts=z_master_recovery_restarts,
         )
 
         if show_z_iter

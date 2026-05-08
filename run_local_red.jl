@@ -2,6 +2,7 @@ using JuMP
 using LinearAlgebra
 using Dates
 using JLD2
+using Random
 
 include("load_problem_data.jl")
 include("print_initial_summary.jl")
@@ -162,6 +163,175 @@ function _load_1day_warm_start(
     )
 end
 
+function _local_red_solution_ok(model)
+    ts = termination_status(model)
+    ps = primal_status(model)
+    return (ts in (
+            JuMP.MOI.OPTIMAL,
+            JuMP.MOI.LOCALLY_SOLVED,
+            JuMP.MOI.ALMOST_OPTIMAL,
+            JuMP.MOI.ALMOST_LOCALLY_SOLVED,
+        )) && (ps in (
+            JuMP.MOI.FEASIBLE_POINT,
+            JuMP.MOI.NEARLY_FEASIBLE_POINT,
+        ))
+end
+
+function _randomize_master_start!(
+    master_x,
+    x_blocks,
+    z_blocks,
+    l_blocks,
+    scenario_slot,
+    w_scenarios_history,
+    rng,
+    grid_size,
+    soc0,
+    pc_max,
+    pd_max,
+    pg_max,
+    n_max,
+    s_max,
+    delta_t,
+    e_batt,
+    cost_scale,
+    is_mip,
+)
+    n_t = grid_size - 1
+    u = master_x[:u]
+    n_start = is_mip ? rand(rng, 1:floor(Int, n_max)) : 1.0 + rand(rng) * (n_max - 1.0)
+    s_start = is_mip ? rand(rng, 1:floor(Int, s_max)) : 1.0 + rand(rng) * (s_max - 1.0)
+    set_start_value(master_x[:n], n_start)
+    set_start_value(master_x[:s], s_start)
+    set_start_value(master_x[:gamma], cost_scale * (1.0 + 10.0 * rand(rng)))
+
+    for t in 1:n_t
+        set_start_value(u[1, t], rand(rng) * n_start * pc_max)
+        set_start_value(u[2, t], rand(rng) * n_start * pd_max)
+    end
+
+    for k in 1:scenario_slot
+        w_k = w_scenarios_history[:, k]
+        if !all(isfinite, w_k)
+            continue
+        end
+
+        set_start_value(x_blocks[k][1], soc0 * n_start * e_batt)
+        for t in 1:n_t
+            u_idx = 2 * (t - 1)
+            w_idx = 6 * (t - 1)
+            z_idx = 2 * (t - 1)
+            pc_t = something(start_value(u[1, t]), 0.0)
+            pd_t = something(start_value(u[2, t]), 0.0)
+            set_start_value(z_blocks[k][z_idx + 1], rand(rng) * pg_max)
+            set_start_value(z_blocks[k][z_idx + 2], rand(rng) * pg_max)
+            set_start_value(
+                x_blocks[k][t + 1],
+                something(start_value(x_blocks[k][t]), soc0 * n_start * e_batt) +
+                (w_k[w_idx + 5] * pc_t - w_k[w_idx + 6] * pd_t) * delta_t,
+            )
+
+            if is_mip
+                l_idx = 2 * (t - 1)
+                set_start_value(l_blocks[k][l_idx + 1], rand(rng, 0:1))
+                set_start_value(l_blocks[k][l_idx + 2], rand(rng, 0:1))
+            else
+                l_idx = 4 * (t - 1)
+                a = rand(rng)
+                b = rand(rng)
+                set_start_value(l_blocks[k][l_idx + 1], a)
+                set_start_value(l_blocks[k][l_idx + 2], 1.0 - a)
+                set_start_value(l_blocks[k][l_idx + 3], b)
+                set_start_value(l_blocks[k][l_idx + 4], 1.0 - b)
+            end
+        end
+    end
+
+    return nothing
+end
+
+function _solve_master_with_recovery!(
+    master_x,
+    x_blocks,
+    z_blocks,
+    l_blocks,
+    scenario_slot,
+    w_scenarios_history,
+    solve_stats,
+    rng,
+    grid_size,
+    soc0,
+    pc_max,
+    pd_max,
+    pg_max,
+    n_max,
+    s_max,
+    delta_t,
+    e_batt,
+    cost_scale,
+    is_mip,
+    max_recovery_restarts,
+)
+    total_elapsed = 0.0
+    last_error = nothing
+    n_attempts = max_recovery_restarts + 1
+
+    for attempt in 1:n_attempts
+        if attempt > 1
+            println("Master solve failed to return a feasible point; random restart ", attempt - 1, " / ", max_recovery_restarts, ".")
+            _randomize_master_start!(
+                master_x,
+                x_blocks,
+                z_blocks,
+                l_blocks,
+                scenario_slot,
+                w_scenarios_history,
+                rng,
+                grid_size,
+                soc0,
+                pc_max,
+                pd_max,
+                pg_max,
+                n_max,
+                s_max,
+                delta_t,
+                e_batt,
+                cost_scale,
+                is_mip,
+            )
+        end
+
+        solve_t0 = time()
+        try
+            optimize!(master_x)
+            last_error = nothing
+        catch err
+            last_error = err
+        end
+        solve_elapsed = time() - solve_t0
+        total_elapsed += solve_elapsed
+        if is_mip
+            solve_stats[:mip_count] += 1
+            solve_stats[:mip_time] += solve_elapsed
+        else
+            solve_stats[:nlp_count] += 1
+            solve_stats[:nlp_time] += solve_elapsed
+        end
+
+        if last_error === nothing && _local_red_solution_ok(master_x)
+            return true, total_elapsed, nothing
+        end
+
+        if last_error !== nothing
+            println("Master solve threw an error: ", sprint(showerror, last_error))
+        else
+            println("Master status: ", termination_status(master_x), " | primal: ", primal_status(master_x))
+        end
+    end
+
+    return false, total_elapsed, last_error
+end
+
 function run_local_red(
     problem_source=nothing;
     processed_data_path::AbstractString=joinpath(@__DIR__, "Processed_Data_15min.csv"),
@@ -185,6 +355,8 @@ function run_local_red(
     tol_2::Float64=1e-6,
     z_master_restarts::Int=5,
     z_master_restart_seed::Int=1234,
+    master_recovery_restarts::Int=20,
+    z_master_recovery_restarts::Int=20,
     show_w_vec::Bool=false,
     show_z_iter::Bool=true,
     is_silent::Bool=false,
@@ -204,6 +376,9 @@ function run_local_red(
     end
     if z_master_restarts < 1
         error("z_master_restarts must be at least 1.")
+    end
+    if min(master_recovery_restarts, z_master_recovery_restarts) < 0
+        error("Recovery restart counts must be nonnegative.")
     end
     if horizon_days < 1
         error("`horizon_days` must be at least 1.")
@@ -437,26 +612,48 @@ function run_local_red(
     )
 
     local_red_t0 = time()
+    master_restart_rng = MersenneTwister(z_master_restart_seed + 10_000)
     for iter in 1:k1_max
         println(repeat("=", 20), " SOLVE MASTER with ", scenario_slot, " scenarios ", repeat("=", 20))
         println("Iteration MASTER: ", iter, " / ", k1_max)
         # Solve the master problem
         print("Solving ", is_mip ? "MIP" : "NLP", "... ")
         flush(stdout)
-        solve_t0 = time()
-        optimize!(master_x)
-        solve_elapsed = time() - solve_t0
-        solve_stats[:nlp_count] += 1
-        solve_stats[:nlp_time] += solve_elapsed
+        master_ok, solve_elapsed, master_error = _solve_master_with_recovery!(
+            master_x,
+            x_blocks,
+            z_blocks,
+            l_blocks,
+            scenario_slot,
+            w_scenarios_history,
+            solve_stats,
+            master_restart_rng,
+            grid_size,
+            soc0,
+            pc_max,
+            pd_max,
+            pg_max,
+            n_max,
+            s_max,
+            delta_t,
+            e_batt,
+            cost_scale,
+            is_mip,
+            master_recovery_restarts,
+        )
         println("Done.")
 
         # Check master solution status
         ts = termination_status(master_x)
         ps = primal_status(master_x)
-        if ts != JuMP.MOI.OPTIMAL && ts != JuMP.MOI.LOCALLY_SOLVED && ts != JuMP.MOI.ALMOST_OPTIMAL && ts != JuMP.MOI.ALMOST_LOCALLY_SOLVED
-            println("MASTER did not return OPTIMAL.")
-            println("Termination status: ", ts)
-            println("Primal status: ", ps)
+        if !master_ok
+            println("MASTER did not return a feasible solution after ", master_recovery_restarts, " recovery restarts.")
+            if master_error !== nothing
+                println("Last error: ", sprint(showerror, master_error))
+            else
+                println("Termination status: ", ts)
+                println("Primal status: ", ps)
+            end
             println("Stopping local reduction.")
             break
         end
@@ -614,6 +811,7 @@ function run_local_red(
                 is_silent=is_silent,
                 z_master_restarts=z_master_restarts,
                 z_master_restart_seed=z_master_restart_seed,
+                z_master_recovery_restarts=z_master_recovery_restarts,
                 show_z_iter=show_z_iter,
                 show_w_vec=show_w_vec,
                 solve_stats=solve_stats,
