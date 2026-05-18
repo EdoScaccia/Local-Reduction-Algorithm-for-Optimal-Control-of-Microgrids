@@ -1,4 +1,3 @@
-using Dates
 using JLD2
 using PyPlot
 
@@ -7,29 +6,41 @@ mplcm = PyPlot.matplotlib.cm
 mplpatches = PyPlot.matplotlib.patches
 
 results_dir = joinpath(@__DIR__, "Results")
+plots_dir = joinpath(@__DIR__, "Plots")
 
 soc0_values = [0.2, 0.4, 0.6, 0.8, 1.0]
 grid_power_factor_values = [0.2, 0.4, 0.6, 0.8, 1.0]
-horizon_days_values = [1, 3, 7]
-
-is_milp = true
-two_batt = false
+horizon_days_values = [1]
+formulations = ["MIP", "NLP"]
 
 function _pct_token(x)
     return round(Int, 100 * x)
 end
 
-function _battery_token(two_batt)
-    return two_batt ? "B2" : "B1"
+function _display_formulation(formulation)
+    f = uppercase(String(formulation))
+    return f in ("MIP", "MILP") ? "MILP" : f
 end
 
-function _formulation_token(is_milp)
-    return is_milp ? "MILP" : "NLP"
+function _canonical_formulation(formulation)
+    f = uppercase(String(formulation))
+    f in ("MIP", "MILP") && return "MIP"
+    f == "NLP" && return "NLP"
+    error("Unknown formulation `$formulation`. Use MIP/MILP or NLP.")
+end
+
+function _formulation_matches(file_formulation, requested_formulation)
+    file_f = _canonical_formulation(file_formulation)
+    requested_f = _canonical_formulation(requested_formulation)
+    return file_f == requested_f
 end
 
 function _parse_result_filename(path)
     name = basename(path)
-    m = match(r"^(MILP|NLP)_SOC0(\d+)_H(\d+)_PG(\d+)_(B[12])_(\d{4}-\d{2}-\d{2}_\d{6})\.jld2$", name)
+    m = match(
+        r"^(MIP|MILP|NLP)_SOC0(\d+)_H(\d+)_PG(\d+)(?:_(B[12]))?_(\d{4}-\d{2}-\d{2}_\d{6})\.jld2$",
+        name,
+    )
     m === nothing && return nothing
 
     return (
@@ -37,26 +48,26 @@ function _parse_result_filename(path)
         soc0=parse(Int, m.captures[2]),
         horizon_days=parse(Int, m.captures[3]),
         grid_power_factor=parse(Int, m.captures[4]),
-        battery=m.captures[5],
+        battery=m.captures[5] === nothing ? "" : m.captures[5],
         timestamp=m.captures[6],
     )
 end
 
-function _latest_result_index(results_dir; is_milp=true, two_batt=false)
+function _latest_result_index(results_dir; formulations=formulations)
     isdir(results_dir) || error("Results directory does not exist: $results_dir")
 
-    formulation = _formulation_token(is_milp)
-    battery = _battery_token(two_batt)
-    index = Dict{Tuple{Int, Int, Int}, String}()
+    requested = Set(_canonical_formulation.(formulations))
+    index = Dict{Tuple{String, Int, Int, Int}, String}()
 
     for path in readdir(results_dir; join=true)
         endswith(path, ".jld2") || continue
         cfg = _parse_result_filename(path)
         cfg === nothing && continue
-        cfg.formulation == formulation || continue
-        cfg.battery == battery || continue
 
-        key = (cfg.soc0, cfg.horizon_days, cfg.grid_power_factor)
+        canonical = _canonical_formulation(cfg.formulation)
+        canonical in requested || continue
+
+        key = (canonical, cfg.soc0, cfg.horizon_days, cfg.grid_power_factor)
         if !haskey(index, key) || mtime(path) > mtime(index[key])
             index[key] = path
         end
@@ -65,50 +76,75 @@ function _latest_result_index(results_dir; is_milp=true, two_batt=false)
     return index
 end
 
+function _last_finite_col(A)
+    for j in axes(A, 2)[end]:-1:axes(A, 2)[begin]
+        if all(isfinite, A[:, j])
+            return j
+        end
+    end
+    return nothing
+end
+
+function _result_has_finite_solution(data)
+    haskey(data, "n_star") && isfinite(Float64(data["n_star"])) || return false
+    haskey(data, "s_star") && isfinite(Float64(data["s_star"])) || return false
+
+    if haskey(data, "u_star_history")
+        col = _last_finite_col(data["u_star_history"])
+        col === nothing && return false
+    end
+
+    if haskey(data, "master_x_obj_history")
+        any(isfinite, data["master_x_obj_history"]) || return false
+    end
+
+    return true
+end
+
 function _read_result_values(path)
-    data = JLD2.load(path)
-    _local_reduction_completed(data) || return NaN, NaN
+    try
+        data = JLD2.load(path)
+        _result_has_finite_solution(data) || return NaN, NaN, :failed
 
-    n_star = haskey(data, "n_star") ? Float64(data["n_star"]) : NaN
-    s_star = haskey(data, "s_star") ? Float64(data["s_star"]) : NaN
-    return n_star, s_star
+        n_star = Float64(data["n_star"])
+        s_star = Float64(data["s_star"])
+        return n_star, s_star, :ok
+    catch
+        return NaN, NaN, :failed
+    end
 end
 
-function _local_reduction_completed(data)
-    haskey(data, "scenarios_added") || return false
-    return Int(data["scenarios_added"]) >= 5
-end
-
-function _build_heatmap_data(index, horizon_days; soc0_values, grid_power_factor_values)
+function _build_heatmap_data(index, formulation, horizon_days; soc0_values, grid_power_factor_values)
     n_grid = fill(NaN, length(soc0_values), length(grid_power_factor_values))
     s_grid = fill(NaN, length(soc0_values), length(grid_power_factor_values))
+    status_grid = fill(:missing, length(soc0_values), length(grid_power_factor_values))
     paths = Matrix{Union{Nothing, String}}(nothing, length(soc0_values), length(grid_power_factor_values))
 
+    canonical = _canonical_formulation(formulation)
     for (i, soc0) in enumerate(soc0_values)
         for (j, grid_power_factor) in enumerate(grid_power_factor_values)
-            key = (_pct_token(soc0), horizon_days, _pct_token(grid_power_factor))
-            haskey(index, key) || continue
+            key = (canonical, _pct_token(soc0), horizon_days, _pct_token(grid_power_factor))
+            if !haskey(index, key)
+                status_grid[i, j] = :missing
+                continue
+            end
 
             path = index[key]
-            n_star, s_star = _read_result_values(path)
-            if isfinite(n_star) && isfinite(s_star)
+            n_star, s_star, status = _read_result_values(path)
+            paths[i, j] = path
+            status_grid[i, j] = status
+            if status == :ok
                 n_grid[i, j] = n_star
                 s_grid[i, j] = s_star
-                paths[i, j] = path
             end
         end
     end
 
-    return n_grid, s_grid, paths
+    return n_grid, s_grid, status_grid, paths
 end
 
-function _default_n_star_bins(finite_n)
-    upper = max(30.0, ceil(maximum(finite_n)))
-    return [0.5, 1.5, 3.5, 5.5, 10.5, 15.5, 20.5, 25.5, upper + 0.5]
-end
-
-function _default_s_star_bins(finite_s)
-    upper = max(30.0, ceil(maximum(finite_s)))
+function _default_star_bins(finite_values)
+    upper = max(30.0, ceil(maximum(finite_values)))
     return [0.5, 1.5, 3.5, 5.5, 10.5, 15.5, 20.5, 25.5, upper + 0.5]
 end
 
@@ -128,15 +164,15 @@ function _bin_tick_labels(boundaries)
     return labels
 end
 
-function _n_colorbar_boundaries(boundaries)
+function _colorbar_boundaries(boundaries)
     return vcat(boundaries[1] - 1.0, boundaries)
 end
 
-function _n_colorbar_labels(boundaries)
+function _colorbar_labels(boundaries)
     return vcat(["INF"], _bin_tick_labels(boundaries))
 end
 
-function _n_colorbar_ticks(colorbar_boundaries)
+function _colorbar_ticks(colorbar_boundaries)
     return [(colorbar_boundaries[k] + colorbar_boundaries[k + 1]) / 2 for k in 1:(length(colorbar_boundaries) - 1)]
 end
 
@@ -144,113 +180,151 @@ function _value_color(value, cmap, norm)
     return cmap(norm(value))
 end
 
+function _draw_heatmap_panel!(
+    ax,
+    n_grid,
+    s_grid,
+    status_grid,
+    formulation,
+    horizon_days,
+    cell_cmap,
+    cell_norm;
+    soc0_values,
+    grid_power_factor_values,
+    show_ylabel=false,
+)
+    ax.set_title(_display_formulation(formulation))
+    ax.set_xlabel("Grid Cap")
+    show_ylabel && ax.set_ylabel("Initial SoC")
+
+    ax.set_xticks(0:length(grid_power_factor_values)-1)
+    ax.set_yticks(0:length(soc0_values)-1)
+    ax.set_xticklabels(["$(_pct_token(x))%" for x in grid_power_factor_values])
+    ax.set_yticklabels(["$(_pct_token(x))%" for x in soc0_values])
+
+    ax.set_xlim(-0.5, length(grid_power_factor_values) - 0.5)
+    ax.set_ylim(-0.5, length(soc0_values) - 0.5)
+    ax.set_aspect("equal")
+
+    for i in 1:length(soc0_values)
+        for j in 1:length(grid_power_factor_values)
+            x0 = j - 1.5
+            y0 = i - 1.5
+            if status_grid[i, j] == :ok && isfinite(n_grid[i, j]) && isfinite(s_grid[i, j])
+                top_color = _value_color(n_grid[i, j], cell_cmap, cell_norm)
+                bottom_color = _value_color(s_grid[i, j], cell_cmap, cell_norm)
+                ax.add_patch(mplpatches.Rectangle((x0, y0 + 0.5), 1.0, 0.5, facecolor=top_color, edgecolor="none"))
+                ax.add_patch(mplpatches.Rectangle((x0, y0), 1.0, 0.5, facecolor=bottom_color, edgecolor="none"))
+            else
+                ax.add_patch(mplpatches.Rectangle((x0, y0), 1.0, 1.0, facecolor="black", edgecolor="none"))
+                ax.text(j - 1, i - 1, "INF", color="white", ha="center", va="center", fontsize=8, fontweight="bold")
+            end
+        end
+    end
+
+    for k in 0:length(grid_power_factor_values)
+        ax.axvline(k - 0.5, color="white", linewidth=1.5)
+    end
+    for k in 0:length(soc0_values)
+        ax.axhline(k - 0.5, color="white", linewidth=1.5)
+    end
+
+    return ax
+end
+
 function plot_milp_experiment_heatmaps(;
     results_dir=results_dir,
+    plots_dir=plots_dir,
     soc0_values=soc0_values,
     grid_power_factor_values=grid_power_factor_values,
     horizon_days_values=horizon_days_values,
-    is_milp=is_milp,
-    two_batt=two_batt,
-    n_star_bins=nothing,
-    s_star_bins=nothing,
+    formulations=formulations,
+    star_bins=nothing,
+    save_plot::Bool=true,
+    filename::AbstractString="LocalReductionHeatmaps.png",
+    dpi::Int=300,
 )
-    index = _latest_result_index(results_dir; is_milp=is_milp, two_batt=two_batt)
+    canonical_formulations = _canonical_formulation.(formulations)
+    index = _latest_result_index(results_dir; formulations=canonical_formulations)
 
-    n_data = Matrix{Float64}[]
-    s_data = Matrix{Float64}[]
+    panel_data = Dict{Tuple{String, Int}, NamedTuple}()
+    finite_values = Float64[]
+
     for horizon_days in horizon_days_values
-        n_grid, s_grid, _ = _build_heatmap_data(
-            index,
-            horizon_days;
-            soc0_values=soc0_values,
-            grid_power_factor_values=grid_power_factor_values,
-        )
-        push!(n_data, n_grid)
-        push!(s_data, s_grid)
+        for formulation in canonical_formulations
+            n_grid, s_grid, status_grid, paths = _build_heatmap_data(
+                index,
+                formulation,
+                horizon_days;
+                soc0_values=soc0_values,
+                grid_power_factor_values=grid_power_factor_values,
+            )
+            panel_data[(formulation, horizon_days)] = (
+                n_grid=n_grid,
+                s_grid=s_grid,
+                status_grid=status_grid,
+                paths=paths,
+            )
+            append!(finite_values, vec(n_grid[isfinite.(n_grid)]))
+            append!(finite_values, vec(s_grid[isfinite.(s_grid)]))
+        end
     end
 
-    finite_n = vcat([vec(grid[isfinite.(grid)]) for grid in n_data]...)
-    isempty(finite_n) && error("No feasible result files found for the selected filters.")
-    finite_s = vcat([vec(grid[isfinite.(grid)]) for grid in s_data]...)
-    isempty(finite_s) && error("No finite s_star values found for the selected filters.")
+    isempty(finite_values) && error("No finite result files found for the selected filters.")
 
-    shared_values = vcat(finite_n, finite_s)
-    shared_boundaries = if n_star_bins !== nothing
-        collect(Float64, n_star_bins)
-    elseif s_star_bins !== nothing
-        collect(Float64, s_star_bins)
-    else
-        _default_n_star_bins(shared_values)
-    end
+    boundaries = star_bins === nothing ? _default_star_bins(finite_values) : collect(Float64, star_bins)
+    cbar_boundaries = _colorbar_boundaries(boundaries)
 
-    n_boundaries = shared_boundaries
-    s_boundaries = shared_boundaries
-    n_cbar_boundaries = _n_colorbar_boundaries(n_boundaries)
-
-    cell_colors = [plt.cm.rainbow(x) for x in range(0.0, 1.0; length=length(shared_boundaries) - 1)]
+    cell_colors = [plt.cm.rainbow(x) for x in range(0.0, 1.0; length=length(boundaries) - 1)]
     cbar_colors = vcat([[0.0, 0.0, 0.0, 1.0]], cell_colors)
     cell_cmap = mplcolors.ListedColormap(cell_colors)
     cbar_cmap = mplcolors.ListedColormap(cbar_colors)
-    n_norm_for_cells = mplcolors.BoundaryNorm(n_boundaries, length(n_boundaries) - 1)
-    n_norm_for_cbar = mplcolors.BoundaryNorm(n_cbar_boundaries, length(n_cbar_boundaries) - 1)
-    s_norm = mplcolors.BoundaryNorm(s_boundaries, length(s_boundaries) - 1)
+    cell_norm = mplcolors.BoundaryNorm(boundaries, length(boundaries) - 1)
+    cbar_norm = mplcolors.BoundaryNorm(cbar_boundaries, length(cbar_boundaries) - 1)
 
-    fig, axs = plt.subplots(1, length(horizon_days_values), figsize=(15, 5), constrained_layout=true)
-    if length(horizon_days_values) == 1
-        axs = [axs]
-    end
+    n_rows = length(horizon_days_values)
+    n_cols = length(canonical_formulations)
+    fig, axs = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 4.8 * n_rows), squeeze=false, constrained_layout=true)
 
-    for (plot_idx, horizon_days) in enumerate(horizon_days_values)
-        ax = axs[plot_idx]
-        n_grid = n_data[plot_idx]
-        s_grid = s_data[plot_idx]
-
-        ax.set_title("$(horizon_days)d")
-        ax.set_xlabel("Grid Cap")
-        plot_idx == 1 && ax.set_ylabel("Initial SoC")
-
-        ax.set_xticks(0:length(grid_power_factor_values)-1)
-        ax.set_yticks(0:length(soc0_values)-1)
-        ax.set_xticklabels(["$(_pct_token(x))%" for x in grid_power_factor_values])
-        ax.set_yticklabels(["$(_pct_token(x))%" for x in soc0_values])
-
-        ax.set_xlim(-0.5, length(grid_power_factor_values) - 0.5)
-        ax.set_ylim(-0.5, length(soc0_values) - 0.5)
-        ax.set_aspect("equal")
-
-        for i in 1:length(soc0_values)
-            for j in 1:length(grid_power_factor_values)
-                x0 = j - 1.5
-                y0 = i - 1.5
-                if isfinite(n_grid[i, j]) && isfinite(s_grid[i, j])
-                    top_color = _value_color(n_grid[i, j], cell_cmap, n_norm_for_cells)
-                    bottom_color = _value_color(s_grid[i, j], cell_cmap, s_norm)
-                    ax.add_patch(mplpatches.Rectangle((x0, y0 + 0.5), 1.0, 0.5, facecolor=top_color, edgecolor="none"))
-                    ax.add_patch(mplpatches.Rectangle((x0, y0), 1.0, 0.5, facecolor=bottom_color, edgecolor="none"))
-                else
-                    ax.add_patch(mplpatches.Rectangle((x0, y0), 1.0, 1.0, facecolor="black", edgecolor="none"))
-                end
-            end
-        end
-
-        for k in 0:length(grid_power_factor_values)
-            ax.axvline(k - 0.5, color="white", linewidth=1.5)
-        end
-        for k in 0:length(soc0_values)
-            ax.axhline(k - 0.5, color="white", linewidth=1.5)
+    for (row, horizon_days) in enumerate(horizon_days_values)
+        for (col, formulation) in enumerate(canonical_formulations)
+            data = panel_data[(formulation, horizon_days)]
+            _draw_heatmap_panel!(
+                axs[row, col],
+                data.n_grid,
+                data.s_grid,
+                data.status_grid,
+                formulation,
+                horizon_days,
+                cell_cmap,
+                cell_norm;
+                soc0_values=soc0_values,
+                grid_power_factor_values=grid_power_factor_values,
+                show_ylabel=col == 1,
+            )
         end
     end
 
-    n_sm = mplcm.ScalarMappable(cmap=cbar_cmap, norm=n_norm_for_cbar)
-    n_sm.set_array([])
-    n_cbar = fig.colorbar(n_sm, ax=axs, ticks=_n_colorbar_ticks(n_cbar_boundaries), shrink=0.85)
-    n_cbar.ax.set_yticklabels(_n_colorbar_labels(n_boundaries))
-    n_cbar.set_label("Top half: n*, bottom half: s*")
+    sm = mplcm.ScalarMappable(cmap=cbar_cmap, norm=cbar_norm)
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=vec(axs), ticks=_colorbar_ticks(cbar_boundaries), shrink=0.85)
+    cbar.ax.set_yticklabels(_colorbar_labels(boundaries))
+    cbar.set_label("Top half: b*, bottom half: s*")
 
-    fig.suptitle("MILP Local Reduction Results", fontsize=14)
+    fig.suptitle("Local Reduction Result Heatmaps", fontsize=14)
+    saved_path = nothing
+    if save_plot
+        mkpath(plots_dir)
+        saved_path = joinpath(plots_dir, filename)
+        fig.savefig(saved_path, dpi=dpi, bbox_inches="tight")
+        println("Saved heatmap figure to: ", saved_path)
+    end
 
     display(fig)
-    return fig, axs
+    return fig, axs, panel_data, saved_path
 end
 
-fig, axs = plot_milp_experiment_heatmaps()
+# if get(ENV, "RUN_EXPERIMENT_HEATMAPS", "0") == "1"
+#     fig, axs, heatmap_data, saved_path = plot_milp_experiment_heatmaps()
+# end
+fig, axs, heatmap_data, saved_path = plot_milp_experiment_heatmaps()
