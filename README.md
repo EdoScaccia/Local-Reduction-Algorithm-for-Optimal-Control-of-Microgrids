@@ -369,3 +369,17 @@ or start Julia with:
 ```powershell
 julia --project=.
 ```
+
+## Citation
+
+If you use this code in your work, please cite the following paper.
+
+```bibtex
+@article{Scaccia2026,
+  title   = {{An Efficient Method for the Optimal Control of Microgrids Under Uncertainties using Local Reduction}},
+  author  = {Scaccia, Edoardo and Kerrigan, Eric C. and Sadowska, Anna},
+  journal = {arXiv preprint arXiv:2606.12345},
+  year    = {2026},
+  url     = {https://arxiv.org/abs/2606.12345}
+}
+```
